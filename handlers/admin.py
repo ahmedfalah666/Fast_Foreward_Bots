@@ -1,0 +1,934 @@
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageOriginChannel, MessageOriginChat
+from telegram.ext import ContextTypes
+from sqlalchemy import select, delete
+from db import AsyncSessionLocal, User, DraftMenuButton, Broadcast, BroadcastRecipient, sync_draft_to_production
+from keyboards import build_menu_keyboard, build_button_edit_keyboard, build_color_picker_keyboard
+from config import ADMIN_IDS, STORAGE_CHANNEL_ID
+
+async def check_admin(user_id: int) -> bool:
+    """Helper to check if user has admin privileges."""
+    if user_id in ADMIN_IDS:
+        return True
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(User).filter_by(user_id=user_id))
+        user = result.scalars().first()
+        return user.is_admin if user else False
+
+async def show_staging_menu(message_or_query, parent_id: int | None):
+    """Renders and sends/updates the staging navigation editor menu."""
+    keyboard = await build_menu_keyboard(parent_id, is_draft=True)
+    menu_title = "Main Menu"
+    if parent_id is not None:
+        async with AsyncSessionLocal() as session:
+            stmt = select(DraftMenuButton).where(DraftMenuButton.id == parent_id)
+            res = await session.execute(stmt)
+            btn = res.scalars().first()
+            if btn:
+                menu_title = btn.title
+                
+    text = (
+        "✦ ─── ⚜️ ─── ✦\n"
+        f"*WORKSPACE EDITOR: {menu_title}*\n\n"
+        "Configure categories, add materials, or publish staging changes live:"
+    )
+    if hasattr(message_or_query, "edit_message_text"):
+        await message_or_query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
+    else:
+        await message_or_query.reply_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
+
+async def show_admin_manage_mode(query, parent_id: int | None):
+    """Renders the staging list in management/edit mode."""
+    keyboard = await build_menu_keyboard(parent_id, is_draft=True, is_manage_mode=True)
+    menu_title = "Main Menu"
+    if parent_id is not None:
+        async with AsyncSessionLocal() as session:
+            stmt = select(DraftMenuButton).where(DraftMenuButton.id == parent_id)
+            res = await session.execute(stmt)
+            btn = res.scalars().first()
+            if btn:
+                menu_title = btn.title
+                
+    text = (
+        "✦ ─── ⚜️ ─── ✦\n"
+        f"*MANAGEMENT DIRECTORY: {menu_title}*\n\n"
+        "Select any button below to open its dedicated editor control panel:"
+    )
+    await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
+
+async def show_admin_edit_panel(message_or_query, btn_id: int):
+    """Renders the control panel details for a specific button."""
+    async with AsyncSessionLocal() as session:
+        stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
+        res = await session.execute(stmt)
+        btn = res.scalars().first()
+        
+    if not btn:
+        if hasattr(message_or_query, "edit_message_text"):
+            await message_or_query.edit_message_text("❌ Button not found.")
+        else:
+            await message_or_query.reply_text("❌ Button not found.")
+        return
+        
+    keyboard = await build_button_edit_keyboard(btn_id)
+    style_display = btn.button_style.upper() if btn.button_style else "DEFAULT (GRAY)"
+    
+    if btn.button_type == "menu":
+        dest_display = "Submenu Directory Folder"
+    elif btn.button_type == "link":
+        dest_display = f"Forwarded File (Msg ID: {btn.source_message_id})"
+    else:
+        dest_display = f"Redirect URL: {btn.credit_text}"
+        
+    details_text = (
+        "✦ ─── ⚜️ ─── ✦\n"
+        "*BUTTON CONTROL PANEL*\n\n"
+        f"• *Label:* {btn.title}\n"
+        f"• *Type:* `{btn.button_type.upper()}`\n"
+        f"• *Background Color:* `{style_display}`\n"
+        f"• *Destination:* `{dest_display}`\n"
+    )
+    if btn.button_type == "link":
+        credits_display = btn.credit_text if btn.credit_text else "None"
+        details_text += f"• *Attached Credits:* `{credits_display}`\n"
+        
+    if hasattr(message_or_query, "edit_message_text"):
+        await message_or_query.edit_message_text(text=details_text, reply_markup=keyboard, parse_mode="Markdown")
+    else:
+        await message_or_query.reply_text(text=details_text, reply_markup=keyboard, parse_mode="Markdown")
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles the /admin command. Checks permissions and launches the draft editor.
+    """
+    user_id = update.effective_user.id
+    if not await check_admin(user_id):
+        await update.message.reply_text("❌ Permission Denied. Admins only.")
+        return
+        
+    await show_staging_menu(update.message, None)
+
+async def admin_menu_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles admin navigation in draft mode (dm:<id> and db:<parent_id>).
+    """
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    
+    if data.startswith("db:"):
+        parent_raw = data.split(":")[1]
+        parent_id = None if parent_raw == "root" else int(parent_raw)
+    elif data.startswith("dm:"):
+        parent_id = int(data.split(":")[1])
+    else:
+        return
+        
+    await show_staging_menu(query, parent_id)
+
+async def admin_manage_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Switches the editor to Management Mode (manage:<parent_id>).
+    """
+    query = update.callback_query
+    await query.answer()
+    
+    parent_raw = query.data.split(":")[1]
+    parent_id = None if parent_raw == "root" else int(parent_raw)
+    
+    await show_admin_manage_mode(query, parent_id)
+
+async def admin_edit_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Opens the edit panel for a specific button (edit:<btn_id>).
+    """
+    query = update.callback_query
+    await query.answer()
+    
+    btn_id = int(query.data.split(":")[1])
+    await show_admin_edit_panel(query, btn_id)
+
+async def _safe_reply(query, text, parse_mode=None, reply_markup=None):
+    """Reply to callback query, falling back to DM if message was deleted."""
+    if query.message:
+        await query.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+    else:
+        await query.get_bot().send_message(
+            chat_id=query.from_user.id, text=text, parse_mode=parse_mode, reply_markup=reply_markup
+        )
+
+async def admin_rename_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Triggers renaming flow (rename:<btn_id>).
+    """
+    query = update.callback_query
+    await query.answer()
+    
+    btn_id = int(query.data.split(":")[1])
+    
+    context.user_data["admin_state"] = "waiting_rename"
+    context.user_data["edit_btn_id"] = btn_id
+    
+    await _safe_reply(query, "✏️ Please send the new Title for the button:")
+
+async def admin_edit_link_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Triggers changing destination target flow (edit_link:<btn_id>).
+    """
+    query = update.callback_query
+    await query.answer()
+    
+    btn_id = int(query.data.split(":")[1])
+    
+    async with AsyncSessionLocal() as session:
+        stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
+        res = await session.execute(stmt)
+        btn = res.scalars().first()
+        
+    if not btn:
+        await _safe_reply(query, "❌ Button not found.")
+        return
+        
+    context.user_data["admin_state"] = "waiting_edit_link"
+    context.user_data["edit_btn_id"] = btn_id
+    
+    if btn.button_type == "link":
+        await _safe_reply(
+            query,
+            "📂 Please *Forward* the new target message/file from your storage channel, "
+            "or send the text/file directly to the bot:",
+            parse_mode="Markdown"
+        )
+    elif btn.button_type in ("fb", "feedback"):
+        await _safe_reply(
+            query,
+            "📝 Please send the new *Telegram Link or Username* of the feedback bot (e.g. `@your_feedback_bot` or `https://t.me/your_feedback_bot`):",
+            parse_mode="Markdown"
+        )
+
+async def admin_color_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Opens background style color picker panel (color:<btn_id>).
+    """
+    query = update.callback_query
+    await query.answer()
+    
+    btn_id = int(query.data.split(":")[1])
+    
+    keyboard = await build_color_picker_keyboard(btn_id)
+    await query.edit_message_text(
+        text="🎨 Choose a background color style for this button:",
+        reply_markup=keyboard
+    )
+
+async def admin_set_color_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Updates the button's background style color in the DB (set_color:<btn_id>:<style_or_none>).
+    """
+    query = update.callback_query
+    await query.answer("Updating style...")
+    
+    parts = query.data.split(":")
+    btn_id = int(parts[1])
+    style = parts[2]
+    
+    button_style = None if style == "none" else style
+    
+    async with AsyncSessionLocal() as session:
+        stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
+        res = await session.execute(stmt)
+        btn = res.scalars().first()
+        if btn:
+            btn.button_style = button_style
+            await session.commit()
+            
+    await show_admin_edit_panel(query, btn_id)
+
+async def admin_reorder_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles moving buttons up or down in sorting order (move:up:<btn_id> / move:down:<btn_id>).
+    """
+    query = update.callback_query
+    await query.answer("Reordering...")
+    
+    parts = query.data.split(":")
+    direction = parts[1]  # 'up' or 'down'
+    btn_id = int(parts[2])
+    
+    async with AsyncSessionLocal() as session:
+        stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
+        res = await session.execute(stmt)
+        btn = res.scalars().first()
+        
+        if not btn:
+            await _safe_reply(query, "❌ Button not found.")
+            return
+            
+        parent_id = btn.parent_id
+        stmt_siblings = select(DraftMenuButton).where(DraftMenuButton.parent_id == parent_id).order_by(DraftMenuButton.order_index)
+        res_siblings = await session.execute(stmt_siblings)
+        siblings = res_siblings.scalars().all()
+        
+        for idx, s in enumerate(siblings):
+            s.order_index = idx
+            
+        active_idx = next(i for i, s in enumerate(siblings) if s.id == btn_id)
+        
+        if direction == "up" and active_idx > 0:
+            siblings[active_idx].order_index = active_idx - 1
+            siblings[active_idx - 1].order_index = active_idx
+            await session.commit()
+        elif direction == "down" and active_idx < len(siblings) - 1:
+            siblings[active_idx].order_index = active_idx + 1
+            siblings[active_idx + 1].order_index = active_idx
+            await session.commit()
+            
+    await show_admin_edit_panel(query, btn_id)
+
+async def admin_edit_back_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Returns to list from edit panel (back_edit:<btn_id> / cancel_color:<btn_id>).
+    """
+    query = update.callback_query
+    await query.answer()
+    
+    btn_id = int(query.data.split(":")[1])
+    
+    async with AsyncSessionLocal() as session:
+        stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
+        res = await session.execute(stmt)
+        btn = res.scalars().first()
+        parent_id = btn.parent_id if btn else None
+        
+    await show_admin_manage_mode(query, parent_id)
+
+async def admin_add_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles clicks on dynamic add button buttons.
+    """
+    query = update.callback_query
+    await query.answer()
+    
+    parts = query.data.split(":")
+    btn_type = parts[1]  # 'menu', 'link', 'fb'
+    parent_raw = parts[2]
+    parent_id = None if parent_raw == "root" else int(parent_raw)
+    
+    context.user_data["admin_state"] = "waiting_for_title"
+    context.user_data["add_parent_id"] = parent_id
+    context.user_data["add_button_type"] = btn_type
+    
+    type_name = "Submenu Folder" if btn_type == "menu" else "Link Button" if btn_type == "link" else "Feedback Button"
+    
+    await _safe_reply(
+        query,
+        f"➕ Adding a new *{type_name}*\n\n"
+        "Please send the *Title* you want to appear on the button:",
+        parse_mode="Markdown"
+    )
+
+async def _resolve_source_for_link(update, context):
+    """
+    Resolves (source_chat_id, source_message_id) for a link button.
+    Always stores content in the storage channel for reliable delivery.
+
+    Priority:
+    1. Forward origin (MessageOriginChannel / MessageOriginChat)
+       → copy original content directly from source chat to storage channel
+    2. Admin's own message text/file
+       → copy from admin DM to storage channel
+
+    Returns (chat_id, message_id) on success, (None, None) on failure.
+    """
+    # Priority 1: forwarded from a channel or group
+    if update.message.forward_origin and STORAGE_CHANNEL_ID:
+        origin = update.message.forward_origin
+        from_chat_id = None
+        from_msg_id = None
+        if isinstance(origin, MessageOriginChannel):
+            from_chat_id = origin.chat.id
+            from_msg_id = origin.message_id
+        elif isinstance(origin, MessageOriginChat):
+            from_chat_id = origin.sender_chat.id
+            from_msg_id = origin.message_id
+
+        if from_chat_id and from_msg_id:
+            try:
+                copied = await context.bot.copy_message(
+                    chat_id=STORAGE_CHANNEL_ID,
+                    from_chat_id=from_chat_id,
+                    message_id=from_msg_id
+                )
+                return STORAGE_CHANNEL_ID, copied.message_id
+            except Exception:
+                pass  # fall through to admin-message copy
+
+    # Priority 2: admin sent content directly → copy to storage channel
+    if STORAGE_CHANNEL_ID:
+        try:
+            copied = await context.bot.copy_message(
+                chat_id=STORAGE_CHANNEL_ID,
+                from_chat_id=update.effective_chat.id,
+                message_id=update.message.message_id
+            )
+            return STORAGE_CHANNEL_ID, copied.message_id
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ Failed to copy to storage channel: {str(e)}\n"
+                "Make sure STORAGE_CHANNEL_ID is set correctly and the bot is an admin there."
+            )
+            return None, None
+
+    await update.message.reply_text(
+        "❌ No storage channel configured and message wasn't forwarded from a channel.\n"
+        "Please forward a message from your channel or set STORAGE_CHANNEL_ID."
+    )
+    return None, None
+
+def _normalize_telegram_link(link: str) -> str:
+    """Normalize @username, t.me/xxx, or bare text to https://t.me/ link."""
+    normalized = link.strip()
+    if normalized.startswith("@"):
+        normalized = f"https://t.me/{normalized[1:]}"
+    elif not normalized.startswith("http://") and not normalized.startswith("https://") and not normalized.startswith("t.me/"):
+        normalized = f"https://t.me/{normalized}"
+    elif normalized.startswith("t.me/"):
+        normalized = f"https://{normalized}"
+    return normalized
+
+async def build_style_selection_keyboard() -> InlineKeyboardMarkup:
+    """Builds the background style selection grid for button creation."""
+    keyboard = [
+        [
+            InlineKeyboardButton("⬜ Default (Gray)", callback_data="add_style:none"),
+            InlineKeyboardButton("🟦 Blue (Primary)", callback_data="add_style:primary")
+        ],
+        [
+            InlineKeyboardButton("🟩 Green (Success)", callback_data="add_style:success"),
+            InlineKeyboardButton("🟥 Red (Danger)", callback_data="add_style:danger")
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Processes text/file inputs from admins during button creation or rename flows.
+    """
+    admin_state = context.user_data.get("admin_state")
+    if not admin_state:
+        return
+        
+    user_id = update.effective_user.id
+    if not await check_admin(user_id):
+        return
+        
+    if admin_state == "waiting_rename":
+        new_title = update.message.text
+        if not new_title:
+            await update.message.reply_text("❌ Title cannot be empty.")
+            return
+            
+        btn_id = context.user_data["edit_btn_id"]
+        async with AsyncSessionLocal() as session:
+            stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
+            res = await session.execute(stmt)
+            btn = res.scalars().first()
+            if btn:
+                btn.title = new_title
+                await session.commit()
+                await update.message.reply_text(f"✅ Button renamed to '{new_title}' successfully!")
+                
+        context.user_data.clear()
+        await show_admin_edit_panel(update.message, btn_id)
+        
+    elif admin_state == "waiting_edit_link":
+        btn_id = context.user_data["edit_btn_id"]
+        
+        async with AsyncSessionLocal() as session:
+            stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
+            res = await session.execute(stmt)
+            btn = res.scalars().first()
+            
+            if not btn:
+                await update.message.reply_text("❌ Button not found in database.")
+                context.user_data.clear()
+                return
+                
+            if btn.button_type == "link":
+                chat_id, msg_id = await _resolve_source_for_link(update, context)
+                if not chat_id or not msg_id:
+                    return  # error already sent by helper
+
+                btn.source_chat_id = chat_id
+                btn.source_message_id = msg_id
+                await session.commit()
+                await update.message.reply_text("✅ Link button file source updated successfully!")
+                
+            elif btn.button_type in ("fb", "feedback"):
+                link = update.message.text
+                if not link:
+                    await update.message.reply_text("❌ Link cannot be empty. Please send text.")
+                    return
+                    
+                normalized_link = _normalize_telegram_link(link)
+                btn.credit_text = normalized_link
+                await session.commit()
+                await update.message.reply_text("✅ Feedback bot link updated successfully!")
+                
+        context.user_data.clear()
+        await show_admin_edit_panel(update.message, btn_id)
+        
+    elif admin_state == "waiting_for_fb_link":
+        link = update.message.text
+        if not link:
+            await update.message.reply_text("❌ Link/username cannot be empty. Please send text.")
+            return
+            
+        context.user_data["new_btn_credit_text"] = _normalize_telegram_link(link)
+        
+        # Transition to style picker
+        context.user_data["admin_state"] = "waiting_style_selection"
+        keyboard = await build_style_selection_keyboard()
+        await update.message.reply_text(
+            "🎨 Select a background color style for this button:",
+            reply_markup=keyboard
+        )
+        
+    elif admin_state == "waiting_for_title":
+        title = update.message.text
+        if not title:
+            await update.message.reply_text("❌ Title cannot be empty. Please send text.")
+            return
+            
+        context.user_data["new_btn_title"] = title
+        btn_type = context.user_data["add_button_type"]
+        
+        if btn_type == "menu":
+            # Move to color style picker
+            context.user_data["admin_state"] = "waiting_style_selection"
+            keyboard = await build_style_selection_keyboard()
+            await update.message.reply_text(
+                "🎨 Select a background color style for this button:",
+                reply_markup=keyboard
+            )
+        elif btn_type == "fb":
+            # Move to feedback link/username prompt
+            context.user_data["admin_state"] = "waiting_for_fb_link"
+            await update.message.reply_text(
+                "📝 Please send the *Telegram Link or Username* of the feedback bot (e.g. `@your_feedback_bot` or `https://t.me/your_feedback_bot`):",
+                parse_mode="Markdown"
+            )
+        elif btn_type == "link":
+            # Link buttons need files
+            context.user_data["admin_state"] = "waiting_for_file"
+            await update.message.reply_text(
+                "📂 Great! Now please *Forward* the target message/file from your storage channel, "
+                "or send the text/file directly to the bot:",
+                parse_mode="Markdown"
+            )
+            
+    elif admin_state == "waiting_for_file":
+        chat_id, msg_id = await _resolve_source_for_link(update, context)
+        if not chat_id or not msg_id:
+            return  # error already sent by helper
+
+        context.user_data["new_btn_chat_id"] = chat_id
+        context.user_data["new_btn_message_id"] = msg_id
+        
+        context.user_data["admin_state"] = "waiting_for_credit"
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ No Credits", callback_data="add_no_credits")]
+        ])
+        await update.message.reply_text(
+            "📝 Enter credits/source (e.g. '@username' or channel link), or click below to skip:",
+            reply_markup=keyboard
+        )
+        
+    elif admin_state == "waiting_for_credit":
+        text = update.message.text
+        context.user_data["new_btn_credit_text"] = text
+        
+        # Transition to style picker
+        context.user_data["admin_state"] = "waiting_style_selection"
+        keyboard = await build_style_selection_keyboard()
+        await update.message.reply_text(
+            "🎨 Select a background color style for this button:",
+            reply_markup=keyboard
+        )
+
+async def admin_add_skip_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the 'No Credits' callback click during adding."""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    if not await check_admin(user_id):
+        return
+        
+    context.user_data["new_btn_credit_text"] = None
+    
+    # Transition to style picker
+    context.user_data["admin_state"] = "waiting_style_selection"
+    keyboard = await build_style_selection_keyboard()
+    await _safe_reply(
+        query,
+        "🎨 Select a background color style for this button:",
+        reply_markup=keyboard
+    )
+
+async def admin_add_style_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles style background color selection and saves the new button."""
+    query = update.callback_query
+    await query.answer("Saving button...")
+    
+    user_id = update.effective_user.id
+    if not await check_admin(user_id):
+        return
+        
+    style = query.data.split(":")[1]
+    button_style = None if style == "none" else style
+    context.user_data["new_btn_style"] = button_style
+    
+    parent_id = context.user_data["add_parent_id"]
+    title = context.user_data["new_btn_title"]
+    
+    await save_button_to_db(context)
+    await _safe_reply(query, f"✅ Button '{title}' added successfully!")
+    context.user_data.clear()
+    
+    await show_staging_menu(query, parent_id)
+
+async def save_button_to_db(context: ContextTypes.DEFAULT_TYPE):
+    """Saves button creation data from user_data directly into draft_menu_buttons."""
+    parent_id = context.user_data["add_parent_id"]
+    btn_type = context.user_data["add_button_type"]
+    title = context.user_data["new_btn_title"]
+    
+    async with AsyncSessionLocal() as session:
+        stmt = select(DraftMenuButton).where(DraftMenuButton.parent_id == parent_id)
+        res = await session.execute(stmt)
+        sibling_buttons = res.scalars().all()
+        next_order = len(sibling_buttons)
+        
+        new_btn = DraftMenuButton(
+            parent_id=parent_id,
+            title=title,
+            button_type=btn_type,
+            order_index=next_order,
+            button_style=context.user_data.get("new_btn_style"),
+            source_chat_id=context.user_data.get("new_btn_chat_id"),
+            source_message_id=context.user_data.get("new_btn_message_id"),
+            credit_text=context.user_data.get("new_btn_credit_text")
+        )
+        session.add(new_btn)
+        await session.commit()
+
+async def admin_delete_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles deletion of menu buttons in staging (del:<id>).
+    """
+    query = update.callback_query
+    await query.answer("Deleting button...")
+    
+    btn_id = int(query.data.split(":")[1])
+    
+    async with AsyncSessionLocal() as session:
+        stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
+        res = await session.execute(stmt)
+        btn = res.scalars().first()
+        
+        if btn:
+            parent_id = btn.parent_id
+            await session.delete(btn)
+            await session.commit()
+            
+            # Reorder remaining siblings
+            stmt_siblings = select(DraftMenuButton).where(DraftMenuButton.parent_id == parent_id).order_by(DraftMenuButton.order_index)
+            res_siblings = await session.execute(stmt_siblings)
+            siblings = res_siblings.scalars().all()
+            for idx, s in enumerate(siblings):
+                s.order_index = idx
+            await session.commit()
+            
+            await show_admin_manage_mode(query, parent_id)
+        else:
+            await _safe_reply(query, "❌ Button not found in database.")
+
+async def admin_publish_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Confirms publishing staging changes to production.
+    """
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "publish_confirm":
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Yes, Publish Live", callback_data="publish_execute"),
+                InlineKeyboardButton("❌ Cancel", callback_data="db:root")
+            ]
+        ])
+        await query.edit_message_text(
+            text="⚠️ *ARE YOU SURE?*\n\nThis will overwrite the current live menu for ALL users with your staging layout.",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+    elif query.data == "publish_execute":
+        try:
+            await sync_draft_to_production()
+            await query.edit_message_text("🚀 *LIVE MENU UPDATED SUCCESSFULY!* 🚀\n\nAll users can now see your changes.")
+        except Exception as e:
+            await query.edit_message_text(f"❌ Synchronization failed: {str(e)}")
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles `/broadcast <message>` command. Sends and stores broadcast for later edit/delete.
+    """
+    user_id = update.effective_user.id
+    if not await check_admin(user_id):
+        await update.message.reply_text("❌ Permission Denied. Admins only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("❌ Please specify the message. Usage: `/broadcast <message>`", parse_mode="Markdown")
+        return
+
+    broadcast_text = " ".join(context.args)
+
+    async with AsyncSessionLocal() as session:
+        stmt = select(User)
+        res = await session.execute(stmt)
+        users = res.scalars().all()
+
+    success_count = 0
+    fail_count = 0
+    recipients_data = []
+
+    status_msg = await update.message.reply_text(f"📢 Starting broadcast to {len(users)} users...")
+
+    for u in users:
+        try:
+            sent = await context.bot.send_message(
+                chat_id=u.user_id,
+                text=broadcast_text,
+                parse_mode="Markdown"
+            )
+            recipients_data.append({
+                "user_id": u.user_id,
+                "chat_id": sent.chat_id,
+                "message_id": sent.message_id
+            })
+            success_count += 1
+        except Exception:
+            fail_count += 1
+
+    # Store in DB
+    async with AsyncSessionLocal() as session:
+        broadcast = Broadcast(
+            text=broadcast_text,
+            parse_mode="Markdown",
+            sent_count=success_count,
+            fail_count=fail_count
+        )
+        session.add(broadcast)
+        await session.flush()
+
+        for r in recipients_data:
+            session.add(BroadcastRecipient(
+                broadcast_id=broadcast.id,
+                user_id=r["user_id"],
+                chat_id=r["chat_id"],
+                message_id=r["message_id"]
+            ))
+        await session.commit()
+
+    await status_msg.edit_text(
+        f"✅ *Broadcast Complete!*\n\n"
+        f"📈 Sent successfully: `{success_count}`\n"
+        f"📉 Failed/Blocked: `{fail_count}`\n"
+        f"🆔 Broadcast ID: `{broadcast.id}`",
+        parse_mode="Markdown"
+    )
+
+async def broadcasts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lists recent broadcasts with edit/delete buttons (/broadcasts)."""
+    user_id = update.effective_user.id
+    if not await check_admin(user_id):
+        await update.message.reply_text("❌ Permission Denied. Admins only.")
+        return
+
+    async with AsyncSessionLocal() as session:
+        stmt = select(Broadcast).order_by(Broadcast.sent_at.desc()).limit(10)
+        res = await session.execute(stmt)
+        broadcasts = res.scalars().all()
+
+    if not broadcasts:
+        await update.message.reply_text("📭 No broadcasts sent yet.")
+        return
+
+    text = "📢 *Sent Broadcasts (last 10):*\n\n"
+    for b in broadcasts:
+        preview = b.text[:50] + "..." if len(b.text) > 50 else b.text
+        text += (
+            f"`#{b.id}` {preview}\n"
+            f"   ✓ {b.sent_count} sent, ✗ {b.fail_count} failed, "
+            f"{b.sent_at.strftime('%Y-%m-%d %H:%M')}\n\n"
+        )
+
+    keyboard = []
+    for b in broadcasts:
+        keyboard.append([
+            InlineKeyboardButton(f"✏️ Edit #{b.id}", callback_data=f"bedit:{b.id}"),
+            InlineKeyboardButton(f"🗑 Delete #{b.id}", callback_data=f"bdelete:{b.id}")
+        ])
+
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def broadcast_action_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles broadcast edit/delete button clicks."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+    if not await check_admin(user_id):
+        return
+
+    action, broadcast_id_str = query.data.split(":")
+    broadcast_id = int(broadcast_id_str)
+
+    async with AsyncSessionLocal() as session:
+        stmt = select(Broadcast).where(Broadcast.id == broadcast_id)
+        res = await session.execute(stmt)
+        broadcast = res.scalars().first()
+
+    if not broadcast:
+        await query.edit_message_text("❌ Broadcast not found.")
+        return
+
+    if action == "bdelete":
+        # Confirm delete
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Yes, Delete", callback_data=f"bdel_yes:{broadcast_id}"),
+                InlineKeyboardButton("❌ Cancel", callback_data="bdel_cancel")
+            ]
+        ])
+        preview = broadcast.text[:100] + "..." if len(broadcast.text) > 100 else broadcast.text
+        await query.edit_message_text(
+            f"⚠️ *Delete Broadcast #{broadcast_id}?*\n\n"
+            f"Content: _{preview}_\n\n"
+            f"This will remove the message from all {broadcast.sent_count} recipients.",
+            reply_markup=keyboard, parse_mode="Markdown"
+        )
+
+    elif action == "bdel_yes":
+        await _delete_broadcast(broadcast_id, query, context)
+
+    elif action == "bdel_cancel":
+        await query.edit_message_text("❌ Deletion cancelled.")
+
+    elif action == "bedit":
+        context.user_data["admin_state"] = "waiting_broadcast_edit"
+        context.user_data["edit_broadcast_id"] = broadcast_id
+        await _safe_reply(query, f"✏️ Send the new text for broadcast `#{broadcast_id}`:", parse_mode="Markdown")
+
+async def _delete_broadcast(broadcast_id: int, query, context):
+    """Deletes broadcast messages from all recipients."""
+    await query.edit_message_text("🗑 Deleting broadcast messages...")
+
+    async with AsyncSessionLocal() as session:
+        stmt = select(BroadcastRecipient).where(BroadcastRecipient.broadcast_id == broadcast_id)
+        res = await session.execute(stmt)
+        recipients = res.scalars().all()
+
+        b_stmt = select(Broadcast).where(Broadcast.id == broadcast_id)
+        b_res = await session.execute(b_stmt)
+        broadcast = b_res.scalars().first()
+
+    removed = 0
+    failed = 0
+    for r in recipients:
+        try:
+            await context.bot.delete_message(chat_id=r.chat_id, message_id=r.message_id)
+            removed += 1
+        except Exception:
+            failed += 1
+
+    async with AsyncSessionLocal() as session:
+        stmt = select(BroadcastRecipient).where(BroadcastRecipient.broadcast_id == broadcast_id)
+        res = await session.execute(stmt)
+        for r in res.scalars().all():
+            await session.delete(r)
+        if broadcast:
+            await session.delete(broadcast)
+        await session.commit()
+
+    await query.edit_message_text(
+        f"✅ *Broadcast #{broadcast_id} deleted!*\n\n"
+        f"🗑 Removed: `{removed}`\n"
+        f"❌ Failed: `{failed}`",
+        parse_mode="Markdown"
+    )
+
+async def handle_broadcast_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the new text input for editing a broadcast."""
+    admin_state = context.user_data.get("admin_state")
+    if admin_state != "waiting_broadcast_edit":
+        return
+
+    user_id = update.effective_user.id
+    if not await check_admin(user_id):
+        return
+
+    new_text = update.message.text
+    if not new_text:
+        await update.message.reply_text("❌ Text cannot be empty.")
+        return
+
+    broadcast_id = context.user_data.get("edit_broadcast_id")
+    context.user_data.clear()
+
+    await update.message.reply_text(f"✏️ Updating broadcast `#{broadcast_id}` for all recipients...", parse_mode="Markdown")
+
+    async with AsyncSessionLocal() as session:
+        stmt = select(BroadcastRecipient).where(BroadcastRecipient.broadcast_id == broadcast_id)
+        res = await session.execute(stmt)
+        recipients = res.scalars().all()
+
+        b_stmt = select(Broadcast).where(Broadcast.id == broadcast_id)
+        b_res = await session.execute(b_stmt)
+        broadcast = b_res.scalars().first()
+
+    updated = 0
+    failed = 0
+    for r in recipients:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=r.chat_id,
+                message_id=r.message_id,
+                text=new_text,
+                parse_mode="Markdown"
+            )
+            updated += 1
+        except Exception:
+            try:
+                await context.bot.send_message(
+                    chat_id=r.chat_id,
+                    text=f"✏️ *Updated:* {new_text}",
+                    parse_mode="Markdown"
+                )
+                updated += 1
+            except Exception:
+                failed += 1
+
+    if broadcast:
+        async with AsyncSessionLocal() as session:
+            broadcast.text = new_text
+            await session.commit()
+
+    await update.message.reply_text(
+        f"✅ *Broadcast #{broadcast_id} updated!*\n\n"
+        f"✏️ Edited: `{updated}`\n"
+        f"❌ Failed: `{failed}`",
+        parse_mode="Markdown"
+    )
