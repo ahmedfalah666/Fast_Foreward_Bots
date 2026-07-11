@@ -6,7 +6,7 @@ from telegram.error import BadRequest, TelegramError
 from telegram.helpers import escape_markdown
 from telegram.ext import ContextTypes
 from sqlalchemy import select, delete
-from db import AsyncSessionLocal, User, DraftMenuButton, Broadcast, BroadcastRecipient, sync_draft_to_production
+from db import AsyncSessionLocal, User, DraftMenuButton, ProductionMenuButton, Broadcast, BroadcastRecipient, sync_draft_to_production, push_table_to_postgres
 from keyboards import build_menu_keyboard, build_button_edit_keyboard, build_color_picker_keyboard, build_parent_selector_keyboard, build_copy_source_keyboard, build_sources_manage_keyboard
 from config import ADMIN_IDS, STORAGE_CHANNEL_ID
 
@@ -37,7 +37,13 @@ async def show_staging_menu(message_or_query, parent_id: int | None):
         "Configure categories, add materials, or publish staging changes live:"
     )
     if hasattr(message_or_query, "edit_message_text"):
-        await message_or_query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
+        try:
+            await message_or_query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
+        except BadRequest as e:
+            if "message is not modified" in str(e).lower():
+                pass
+            else:
+                raise
     else:
         await message_or_query.reply_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
 
@@ -58,7 +64,13 @@ async def show_admin_manage_mode(query, parent_id: int | None):
         f"*MANAGEMENT DIRECTORY: {menu_title}*\n\n"
         "Select any button below to open its dedicated editor control panel:"
     )
-    await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
+    try:
+        await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
+    except BadRequest as e:
+        if "message is not modified" in str(e).lower():
+            pass
+        else:
+            raise
 
 async def show_admin_edit_panel(message_or_query, btn_id: int):
     """Renders the control panel details for a specific button."""
@@ -100,7 +112,13 @@ async def show_admin_edit_panel(message_or_query, btn_id: int):
         details_text += f"• *Attached Credits:* `{credits_display}`\n"
         
     if hasattr(message_or_query, "edit_message_text"):
-        await message_or_query.edit_message_text(text=details_text, reply_markup=keyboard, parse_mode="Markdown")
+        try:
+            await message_or_query.edit_message_text(text=details_text, reply_markup=keyboard, parse_mode="Markdown")
+        except BadRequest as e:
+            if "message is not modified" in str(e).lower():
+                pass  # Silent ignore
+            else:
+                raise
     else:
         await message_or_query.reply_text(text=details_text, reply_markup=keyboard, parse_mode="Markdown")
 
@@ -249,6 +267,7 @@ async def admin_set_color_execute(update: Update, context: ContextTypes.DEFAULT_
         if btn:
             btn.button_style = button_style
             await session.commit()
+            await push_table_to_postgres(DraftMenuButton)
             
     await show_admin_edit_panel(query, btn_id)
 
@@ -289,11 +308,13 @@ async def admin_reorder_execute(update: Update, context: ContextTypes.DEFAULT_TY
             siblings[active_idx].order_index = active_idx - 1
             siblings[active_idx - 1].order_index = active_idx
             await session.commit()
+            await push_table_to_postgres(DraftMenuButton)
             reordered = True
         elif direction == "down" and active_idx < len(siblings) - 1:
             siblings[active_idx].order_index = active_idx + 1
             siblings[active_idx + 1].order_index = active_idx
             await session.commit()
+            await push_table_to_postgres(DraftMenuButton)
             reordered = True
 
     if reordered:
@@ -511,6 +532,7 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if btn:
                 btn.title = new_title
                 await session.commit()
+                await push_table_to_postgres(DraftMenuButton)
                 await update.message.reply_text(f"✅ Button renamed to '{new_title}' successfully!")
                 
         context.user_data.clear()
@@ -537,6 +559,7 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 btn.source_chat_id = chat_id
                 btn.source_message_id = msg_id
                 await session.commit()
+                await push_table_to_postgres(DraftMenuButton)
                 await update.message.reply_text("✅ Link button file source updated successfully!")
                 
             elif btn.button_type in ("fb", "feedback"):
@@ -548,6 +571,7 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 normalized_link = _normalize_telegram_link(link)
                 btn.credit_text = normalized_link
                 await session.commit()
+                await push_table_to_postgres(DraftMenuButton)
                 await update.message.reply_text("✅ Feedback bot link updated successfully!")
                 
         context.user_data.clear()
@@ -665,6 +689,7 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 btn.source_chat_id = chat_id
                 btn.source_message_id = msg_id
                 await session.commit()
+                await push_table_to_postgres(DraftMenuButton)
 
         context.user_data.clear()
         await update.message.reply_text("✅ Primary source replaced!")
@@ -699,6 +724,7 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 extra.append({"chat_id": chat_id, "message_id": msg_id})
                 btn.extra_sources = json.dumps(extra)
                 await session.commit()
+                await push_table_to_postgres(DraftMenuButton)
 
         context.user_data.clear()
         await update.message.reply_text("✅ Extra source added!")
@@ -729,6 +755,7 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if btn:
                 btn.credit_text = text
                 await session.commit()
+                await push_table_to_postgres(DraftMenuButton)
 
         context.user_data.clear()
         await update.message.reply_text("✅ Credits updated!")
@@ -812,6 +839,7 @@ async def save_button_to_db(context: ContextTypes.DEFAULT_TYPE):
         )
         session.add(new_btn)
         await session.commit()
+        await push_table_to_postgres(DraftMenuButton)
 
 async def admin_delete_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -831,6 +859,7 @@ async def admin_delete_click(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parent_id = btn.parent_id
             await session.delete(btn)
             await session.commit()
+            await push_table_to_postgres(DraftMenuButton)
             
             # Reorder remaining siblings
             stmt_siblings = select(DraftMenuButton).where(DraftMenuButton.parent_id == parent_id).order_by(DraftMenuButton.order_index)
@@ -839,6 +868,7 @@ async def admin_delete_click(update: Update, context: ContextTypes.DEFAULT_TYPE)
             for idx, s in enumerate(siblings):
                 s.order_index = idx
             await session.commit()
+            await push_table_to_postgres(DraftMenuButton)
             
             await show_admin_manage_mode(query, parent_id)
         else:
@@ -976,6 +1006,7 @@ async def admin_move_to_select(update: Update, context: ContextTypes.DEFAULT_TYP
             s.order_index = idx
 
         await session.commit()
+        await push_table_to_postgres(DraftMenuButton)
 
     parent_name = "Main Menu (Root)"
     if new_parent is not None:
@@ -1093,6 +1124,7 @@ async def admin_copy_execute(update: Update, context: ContextTypes.DEFAULT_TYPE)
             next_order += 1
 
         await session.commit()
+        await push_table_to_postgres(DraftMenuButton)
 
     source_name = "Main Menu (Root)"
     if source_parent is not None:
@@ -1222,6 +1254,7 @@ async def admin_source_delete(update: Update, context: ContextTypes.DEFAULT_TYPE
                 extra.pop(idx)
                 btn.extra_sources = json.dumps(extra) if extra else None
                 await session.commit()
+                await push_table_to_postgres(DraftMenuButton)
 
     await admin_source_manage(update, context)
 
@@ -1260,6 +1293,8 @@ async def admin_publish_click(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif query.data == "publish_execute":
         try:
             await sync_draft_to_production()
+            await push_table_to_postgres(DraftMenuButton)
+            await push_table_to_postgres(ProductionMenuButton)
             await query.edit_message_text("🚀 *LIVE MENU UPDATED SUCCESSFULY!* 🚀\n\nAll users can now see your changes.")
         except Exception as e:
             await query.edit_message_text(f"❌ Synchronization failed: {str(e)}")
@@ -1325,6 +1360,8 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 message_id=r["message_id"]
             ))
         await session.commit()
+        await push_table_to_postgres(Broadcast)
+        await push_table_to_postgres(BroadcastRecipient)
 
     await status_msg.edit_text(
         f"✅ *Broadcast Complete!*\n\n"
@@ -1446,6 +1483,8 @@ async def _delete_broadcast(broadcast_id: int, query, context):
         if broadcast:
             await session.delete(broadcast)
         await session.commit()
+        await push_table_to_postgres(Broadcast)
+        await push_table_to_postgres(BroadcastRecipient)
 
     await query.edit_message_text(
         f"✅ *Broadcast #{broadcast_id} deleted!*\n\n"
@@ -1509,6 +1548,7 @@ async def handle_broadcast_edit_input(update: Update, context: ContextTypes.DEFA
         async with AsyncSessionLocal() as session:
             broadcast.text = new_text
             await session.commit()
+            await push_table_to_postgres(Broadcast)
 
     await update.message.reply_text(
         f"✅ *Broadcast #{broadcast_id} updated!*\n\n"

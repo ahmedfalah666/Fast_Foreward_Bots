@@ -6,36 +6,36 @@ from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy import Column, Integer, BigInteger, String, Boolean, ForeignKey, DateTime, Text, select, delete, event
 from config import DATABASE_URL, ADMIN_IDS
 
-# Adjust DATABASE_URL for async SQLAlchemy driver
-_db_url = (DATABASE_URL or "").strip()
-if not _db_url:
-    _db_url = "sqlite+aiosqlite:///bot_local.db"
-elif _db_url.startswith("postgres://"):
-    _db_url = _db_url.replace("postgres://", "postgresql+asyncpg://", 1)
-elif _db_url.startswith("postgresql://") and "+asyncpg" not in _db_url and "+psycopg" not in _db_url:
-    _db_url = _db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+# ─── PostgreSQL engine (central source of truth for failover) ─────────
+_pg_url = (DATABASE_URL or "").strip()
+if _pg_url and ("postgres://" in _pg_url or "postgresql://" in _pg_url):
+    if _pg_url.startswith("postgres://"):
+        _pg_url = _pg_url.replace("postgres://", "postgresql+asyncpg://", 1)
+    elif _pg_url.startswith("postgresql://") and "+asyncpg" not in _pg_url and "+psycopg" not in _pg_url:
+        _pg_url = _pg_url.replace("postgresql://", "postgresql+asyncpg://", 1)
 
-# Handle sslmode for asyncpg (which uses 'ssl' param instead of 'sslmode')
-_connect_args = {}
-if "sslmode=require" in _db_url:
-    _db_url = _db_url.replace("?sslmode=require", "").replace("&sslmode=require", "")
-    _connect_args["ssl"] = "require"
+    _connect_args = {}
+    if "sslmode=require" in _pg_url:
+        _pg_url = _pg_url.replace("?sslmode=require", "").replace("&sslmode=require", "")
+        _connect_args["ssl"] = "require"
 
-# Create async engine and session factory
-engine_kwargs = dict(echo=False)
-if _connect_args:
-    engine_kwargs["connect_args"] = _connect_args
-engine = create_async_engine(_db_url, **engine_kwargs)
+    engine_pg = create_async_engine(_pg_url, echo=False, connect_args=_connect_args or None)
+    AsyncSessionPG = async_sessionmaker(bind=engine_pg, class_=AsyncSession, expire_on_commit=False)
+else:
+    engine_pg = None
+    AsyncSessionPG = None
+
+# ─── SQLite engine (fast local reads/writes) ──────────────────────────
+engine = create_async_engine("sqlite+aiosqlite:///bot_local.db", echo=False)
 AsyncSessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 
-# Enable foreign key enforcement for SQLite (needed for CASCADE deletes)
-# PostgreSQL enforces FK constraints natively.
-if "sqlite" in _db_url:
-    @event.listens_for(engine.sync_engine, "connect")
-    def _set_sqlite_pragma(dbapi_connection, connection_record):
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
+
+@event.listens_for(engine.sync_engine, "connect")
+def _set_sqlite_pragma(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
+
 
 Base = declarative_base()
 
@@ -60,13 +60,13 @@ class DraftMenuButton(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     parent_id = Column(Integer, ForeignKey("draft_menu_buttons.id", ondelete="CASCADE"), nullable=True)
     title = Column(String, nullable=False)
-    button_type = Column(String, nullable=False)  # 'menu', 'link', 'feedback'
+    button_type = Column(String, nullable=False)
     order_index = Column(Integer, default=0)
-    button_style = Column(String, nullable=True)  # Store native style e.g., 'primary', 'success', 'danger'
+    button_style = Column(String, nullable=True)
     source_chat_id = Column(BigInteger, nullable=True)
     source_message_id = Column(Integer, nullable=True)
     credit_text = Column(String, nullable=True)
-    extra_sources = Column(Text, nullable=True)  # JSON list: [{"chat_id":..., "message_id":...}, ...]
+    extra_sources = Column(Text, nullable=True)
 
 class Broadcast(Base):
     __tablename__ = "broadcasts"
@@ -92,30 +92,38 @@ class BroadcastRecipient(Base):
 class ProductionMenuButton(Base):
     __tablename__ = "production_menu_buttons"
 
-    id = Column(Integer, primary_key=True)  # No autoincrement here because we copy exact IDs from draft
+    id = Column(Integer, primary_key=True)
     parent_id = Column(Integer, ForeignKey("production_menu_buttons.id", ondelete="CASCADE"), nullable=True)
     title = Column(String, nullable=False)
-    button_type = Column(String, nullable=False)  # 'menu', 'link', 'feedback'
+    button_type = Column(String, nullable=False)
     order_index = Column(Integer, default=0)
     button_style = Column(String, nullable=True)
     source_chat_id = Column(BigInteger, nullable=True)
     source_message_id = Column(Integer, nullable=True)
     credit_text = Column(String, nullable=True)
-    extra_sources = Column(Text, nullable=True)  # JSON list
+    extra_sources = Column(Text, nullable=True)
 
 class BotLock(Base):
     __tablename__ = "bot_lock"
 
-    id = Column(Integer, primary_key=True)  # Always 1 (singleton row)
+    id = Column(Integer, primary_key=True)
     instance_name = Column(String, nullable=False)
     last_heartbeat = Column(DateTime, nullable=False)
 
-# Helper to initialize DB
+# ─── All tables that get synced between SQLite and PostgreSQL ─────────
+SYNC_TABLES = [User, CreditTemplate, DraftMenuButton, Broadcast, BroadcastRecipient, ProductionMenuButton]
+
+
 async def init_db():
+    """Create tables in both SQLite and PostgreSQL."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    
-    # Auto-bootstrap admins from config
+
+    if engine_pg is not None:
+        async with engine_pg.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+    # Bootstrap admins + credit templates (SQLite only; PG gets them via sync)
     async with AsyncSessionLocal() as session:
         for admin_id in ADMIN_IDS:
             result = await session.execute(select(User).filter_by(user_id=admin_id))
@@ -127,8 +135,7 @@ async def init_db():
                 if not user.is_admin:
                     user.is_admin = True
         await session.commit()
-    
-    # Prepopulate credit templates if table is empty
+
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(CreditTemplate).limit(1))
         if not result.scalars().first():
@@ -141,20 +148,56 @@ async def init_db():
             session.add_all(templates)
             await session.commit()
 
-# Helper to sync Draft menu to Production menu
+
+# ─── Sync helpers ─────────────────────────────────────────────────────
+
+async def pull_from_postgres():
+    """Pull all data from PostgreSQL → replace local SQLite (called on startup)."""
+    if engine_pg is None:
+        return
+
+    async with AsyncSessionPG() as pg_session:
+        for table_class in SYNC_TABLES:
+            rows = (await pg_session.execute(select(table_class))).scalars().all()
+            if not rows:
+                continue
+
+            async with AsyncSessionLocal() as local_session:
+                await local_session.execute(delete(table_class))
+                for row in rows:
+                    local_session.add(row)
+                await local_session.commit()
+
+            print(f"  Synced {table_class.__tablename__}: {len(rows)} rows")
+
+
+async def push_table_to_postgres(table_class):
+    """Push one table from SQLite → PostgreSQL (called after admin writes)."""
+    if engine_pg is None:
+        return
+
+    async with AsyncSessionLocal() as local_session:
+        rows = (await local_session.execute(select(table_class))).scalars().all()
+
+    async with AsyncSessionPG() as pg_session:
+        await pg_session.execute(delete(table_class))
+        for row in rows:
+            pg_session.add(row)
+        await pg_session.commit()
+
+
+# ─── Draft → Production sync ──────────────────────────────────────────
+
 async def sync_draft_to_production():
     async with AsyncSessionLocal() as session:
         async with session.begin():
-            # 1. Clear production menu buttons
             await session.execute(delete(ProductionMenuButton))
-            
-            # 2. Fetch all draft menu buttons
+
             draft_result = await session.execute(select(DraftMenuButton))
             draft_buttons = draft_result.scalars().all()
-            
-            # 3. Insert into production, preserving the exact same IDs and parent IDs
+
             sorted_draft = sorted(draft_buttons, key=lambda x: x.id)
-            
+
             for db in sorted_draft:
                 pb = ProductionMenuButton(
                     id=db.id,

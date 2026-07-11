@@ -5,7 +5,7 @@ from telegram.error import BadRequest, TelegramError
 from telegram.helpers import escape_markdown
 from telegram.ext import ContextTypes
 from sqlalchemy import select
-from db import AsyncSessionLocal, User, DraftMenuButton, ProductionMenuButton
+from db import AsyncSessionLocal, User, DraftMenuButton, ProductionMenuButton, push_table_to_postgres
 from keyboards import build_menu_keyboard
 
 logger = logging.getLogger(__name__)
@@ -27,6 +27,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db_user = User(user_id=user_id, username=username, first_name=first_name)
             session.add(db_user)
             await session.commit()
+            await push_table_to_postgres(User)
             
     # 2. Render Main Menu
     keyboard = await build_menu_keyboard(None, is_draft=False)

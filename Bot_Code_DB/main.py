@@ -22,7 +22,7 @@ from telegram.ext import (
 )
 
 from config import BOT_TOKEN
-from db import init_db, AsyncSessionLocal, BotLock
+from db import init_db, AsyncSessionLocal, AsyncSessionPG, BotLock, pull_from_postgres, push_table_to_postgres
 from handlers.user import (
     start_command,
     user_menu_navigation,
@@ -84,8 +84,8 @@ INSTANCE_NAME = os.getenv("BOT_INSTANCE_NAME") or socket.gethostname()
 logger = logging.getLogger(__name__)
 
 async def _try_acquire_lock() -> bool:
-    """Try to claim the singleton BotLock. Returns True if acquired."""
-    async with AsyncSessionLocal() as session:
+    """Try to claim the singleton BotLock on PostgreSQL. Returns True if acquired."""
+    async with AsyncSessionPG() as session:
         result = await session.execute(select(BotLock).where(BotLock.id == 1))
         lock = result.scalars().first()
         now = datetime.utcnow()
@@ -106,7 +106,7 @@ async def _try_acquire_lock() -> bool:
 
 async def _release_lock():
     """Mark the lock as stale so another instance can claim it."""
-    async with AsyncSessionLocal() as session:
+    async with AsyncSessionPG() as session:
         result = await session.execute(select(BotLock).where(BotLock.id == 1))
         lock = result.scalars().first()
         if lock and lock.instance_name == INSTANCE_NAME:
@@ -114,11 +114,11 @@ async def _release_lock():
             await session.commit()
 
 async def _heartbeat_loop():
-    """Background task: update last_heartbeat every HEARTBEAT_INTERVAL seconds."""
+    """Background task: update last_heartbeat on PostgreSQL every HEARTBEAT_INTERVAL seconds."""
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL)
         try:
-            async with AsyncSessionLocal() as session:
+            async with AsyncSessionPG() as session:
                 result = await session.execute(select(BotLock).where(BotLock.id == 1))
                 lock = result.scalars().first()
                 if lock and lock.instance_name == INSTANCE_NAME:
@@ -197,6 +197,11 @@ async def post_init(application: Application):
             break
         logger.info("Lock held by another instance — retrying in 10s...")
         await asyncio.sleep(10)
+
+    # ── Sync from PostgreSQL → SQLite (so local data is current) ──
+    logger.info("Pulling data from PostgreSQL into local SQLite...")
+    await pull_from_postgres()
+    logger.info("Sync complete")
 
     # ── Start heartbeat ──
     asyncio.create_task(_heartbeat_loop())
