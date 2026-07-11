@@ -81,7 +81,8 @@ logger = logging.getLogger(__name__)
 LOCK_STALE_SECONDS = 30
 HEARTBEAT_INTERVAL = 10
 INSTANCE_NAME = os.getenv("BOT_INSTANCE_NAME") or socket.gethostname()
-logger = logging.getLogger(__name__)
+_conflict_detected = False
+_application_ref = None  # Set in post_init, used by heartbeat to stop on conflict
 
 async def _try_acquire_lock() -> bool:
     """Try to claim the singleton BotLock on PostgreSQL. Returns True if acquired."""
@@ -115,8 +116,16 @@ async def _release_lock():
 
 async def _heartbeat_loop():
     """Background task: update last_heartbeat on PostgreSQL every HEARTBEAT_INTERVAL seconds."""
+    global _conflict_detected
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL)
+        if _conflict_detected:
+            logger.warning("409 Conflict detected — releasing lock and stopping")
+            await _release_lock()
+            app = _application_ref
+            if app:
+                await app.stop()
+            return
         try:
             async with AsyncSessionPG() as session:
                 result = await session.execute(select(BotLock).where(BotLock.id == 1))
@@ -145,7 +154,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     import html
     import json
     import datetime
+    from telegram.error import Conflict as _Conflict
     from config import ADMIN_IDS
+
+    global _conflict_detected
+    if isinstance(context.error, _Conflict):
+        logger.warning("409 Conflict detected — another instance is active")
+        _conflict_detected = True
+        return
 
     logger.error("Exception while handling an update:", exc_info=context.error)
 
@@ -183,8 +199,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             logger.error(f"Failed to send error notification to admin {admin_id}: {notify_err}")
 
 async def post_init(application: Application):
-    """Initializes the database tables and sets bot commands autocomplete list at startup."""
-    logger.info("Initializing database tables...")
+    """Initialize DB, acquire lock, sync from PG, start heartbeat, set commands."""
+    global _application_ref, _conflict_detected
+    _application_ref = application
+    _conflict_detected = False
+
     await init_db()
     logger.info("Database initialized successfully.")
 
@@ -198,7 +217,7 @@ async def post_init(application: Application):
         logger.info("Lock held by another instance — retrying in 10s...")
         await asyncio.sleep(10)
 
-    # ── Sync from PostgreSQL → SQLite (so local data is current) ──
+    # ── Sync from PostgreSQL → SQLite ──
     logger.info("Pulling data from PostgreSQL into local SQLite...")
     await pull_from_postgres()
     logger.info("Sync complete")
@@ -225,35 +244,24 @@ async def post_shutdown(application: Application):
     await _release_lock()
     logger.info("Failover lock released.")
 
-def main():
-    """Starts the Telegram bot."""
-    if not BOT_TOKEN:
-        logger.error("❌ BOT_TOKEN is missing! Please set it in your environment or .env file.")
-        sys.exit(1)
-        
-    logger.info("Starting Telegram Bot Application...")
-    
-    # Initialize application
+def _build_application():
+    """Build and return the Application with all handlers registered."""
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
-    
-    # Register Commands
+
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
     application.add_handler(CommandHandler("broadcasts", broadcasts_command))
     application.add_handler(CommandHandler("users", users_command))
-    
-    # Register Production (User) Callback Handlers
+
     application.add_handler(CallbackQueryHandler(user_menu_navigation, pattern=r"^(m|b):"))
     application.add_handler(CallbackQueryHandler(user_link_click, pattern=r"^(d)?l:"))
-    
-    # Register Staging (Admin) Callback Handlers
+
     application.add_handler(CallbackQueryHandler(admin_menu_navigation, pattern=r"^(dm|db):"))
     application.add_handler(CallbackQueryHandler(admin_add_click, pattern=r"^add:"))
     application.add_handler(CallbackQueryHandler(admin_delete_click, pattern=r"^del:"))
     application.add_handler(CallbackQueryHandler(admin_publish_click, pattern=r"^publish_"))
-    
-    # New Admin Management Handlers
+
     application.add_handler(CallbackQueryHandler(admin_manage_mode, pattern=r"^manage:"))
     application.add_handler(CallbackQueryHandler(admin_edit_panel, pattern=r"^edit:"))
     application.add_handler(CallbackQueryHandler(admin_rename_click, pattern=r"^rename:"))
@@ -264,51 +272,62 @@ def main():
     application.add_handler(CallbackQueryHandler(admin_set_color_execute, pattern=r"^set_color:"))
     application.add_handler(CallbackQueryHandler(admin_add_style_selection, pattern=r"^add_style:"))
     application.add_handler(CallbackQueryHandler(admin_edit_link_click, pattern=r"^edit_link:"))
-    
-    # Move-to-parent handlers
+
     application.add_handler(CallbackQueryHandler(admin_move_to_click, pattern=r"^parent_sel:"))
     application.add_handler(CallbackQueryHandler(admin_move_to_nav, pattern=r"^parent_nav:"))
     application.add_handler(CallbackQueryHandler(admin_move_to_select, pattern=r"^parent_pick:"))
-    
-    # Copy menu contents handlers
+
     application.add_handler(CallbackQueryHandler(admin_copy_click, pattern=r"^copy_sel:"))
     application.add_handler(CallbackQueryHandler(admin_copy_nav, pattern=r"^copy_nav:"))
     application.add_handler(CallbackQueryHandler(admin_copy_execute, pattern=r"^copy_pick:"))
-    
-    # Multi-file add flow handlers
+
     application.add_handler(CallbackQueryHandler(admin_add_more_file, pattern=r"^add_more_file$"))
     application.add_handler(CallbackQueryHandler(admin_finish_files, pattern=r"^add_finish_files$"))
-    
-    # Source management handlers
+
     application.add_handler(CallbackQueryHandler(admin_source_manage, pattern=r"^src_manage:"))
     application.add_handler(CallbackQueryHandler(admin_source_replace, pattern=r"^src_replace:"))
     application.add_handler(CallbackQueryHandler(admin_source_delete, pattern=r"^src_del:"))
     application.add_handler(CallbackQueryHandler(admin_source_add, pattern=r"^src_add:"))
-    
-    # Edit credits handlers
+
     application.add_handler(CallbackQueryHandler(admin_edit_credit_click, pattern=r"^edit_credit:"))
     application.add_handler(CallbackQueryHandler(admin_edit_credit_skip, pattern=r"^edit_credit_skip:"))
-    
-    # Broadcast management handlers
+
     application.add_handler(CallbackQueryHandler(broadcast_action_handler, pattern=r"^(bedit|bdelete|bdel_yes|bdel_cancel):"))
-    
-    # Users list pagination
+
     application.add_handler(CallbackQueryHandler(users_page_callback, pattern=r"^users_page:"))
-    
-    # Register generic message handler for text/file inputs
+
     application.add_handler(
         MessageHandler(
             filters.ALL & (~filters.COMMAND),
             route_all_messages
         )
     )
-    
-    # Register global error handler
+
     application.add_error_handler(error_handler)
-    
-    # Start Polling loop
-    logger.info("Bot is polling. Press Ctrl+C to stop.")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    return application
+
+def main():
+    """Starts the Telegram bot with failover support."""
+    if not BOT_TOKEN:
+        logger.error("❌ BOT_TOKEN is missing! Please set it in your environment or .env file.")
+        sys.exit(1)
+
+    while True:
+        logger.info("Starting Telegram Bot Application...")
+        application = _build_application()
+
+        try:
+            application.run_polling(allowed_updates=Update.ALL_TYPES)
+        except Exception as e:
+            logger.error(f"Application stopped with error: {e}")
+
+        if _conflict_detected:
+            logger.info("Standby — lock released due to conflict, retrying in 10s...")
+            asyncio.run(asyncio.sleep(10))
+            continue
+
+        logger.info("Bot stopped. Exiting.")
+        break
 
 if __name__ == "__main__":
     main()

@@ -5,6 +5,7 @@ from datetime import timedelta
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy import Column, Integer, BigInteger, String, Boolean, ForeignKey, DateTime, Text, select, delete, event
+from sqlalchemy.pool import NullPool
 from config import DATABASE_URL, ADMIN_IDS
 
 # ─── PostgreSQL engine (central source of truth for failover) ─────────
@@ -20,14 +21,14 @@ if _pg_url and ("postgres://" in _pg_url or "postgresql://" in _pg_url):
         _pg_url = _pg_url.replace("?sslmode=require", "").replace("&sslmode=require", "")
         _connect_args["ssl"] = "require"
 
-    engine_pg = create_async_engine(_pg_url, echo=False, connect_args=_connect_args or None)
+    engine_pg = create_async_engine(_pg_url, echo=False, connect_args=_connect_args or None, poolclass=NullPool)
     AsyncSessionPG = async_sessionmaker(bind=engine_pg, class_=AsyncSession, expire_on_commit=False)
 else:
     engine_pg = None
     AsyncSessionPG = None
 
 # ─── SQLite engine (fast local reads/writes) ──────────────────────────
-engine = create_async_engine("sqlite+aiosqlite:///bot_local.db", echo=False)
+engine = create_async_engine("sqlite+aiosqlite:///bot_local.db", echo=False, poolclass=NullPool)
 AsyncSessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 
 
@@ -165,10 +166,9 @@ async def pull_from_postgres():
 
             async with AsyncSessionLocal() as local_session:
                 await local_session.execute(delete(table_class))
-                for row in rows:
-                    # Detach from PG session by creating a fresh instance
-                    state = row.__dict__.copy()
-                    state.pop('_sa_instance_state', None)
+                # Sort by id so parents are inserted before children (self-referencing FK)
+                for row in sorted(rows, key=lambda r: getattr(r, 'id', 0)):
+                    state = {k: v for k, v in row.__dict__.items() if not k.startswith('_')}
                     new_row = table_class(**state)
                     local_session.add(new_row)
                 await local_session.commit()
@@ -189,9 +189,8 @@ async def _push_table_impl(table_class):
 
         async with AsyncSessionPG() as pg_session:
             await pg_session.execute(delete(table_class))
-            for row in rows:
-                state = row.__dict__.copy()
-                state.pop('_sa_instance_state', None)
+            for row in sorted(rows, key=lambda r: getattr(r, 'id', 0)):
+                state = {k: v for k, v in row.__dict__.items() if not k.startswith('_')}
                 new_row = table_class(**state)
                 pg_session.add(new_row)
             await pg_session.commit()
