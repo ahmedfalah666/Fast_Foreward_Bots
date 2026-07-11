@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import json
 from datetime import timedelta
@@ -165,25 +166,37 @@ async def pull_from_postgres():
             async with AsyncSessionLocal() as local_session:
                 await local_session.execute(delete(table_class))
                 for row in rows:
-                    local_session.add(row)
+                    # Detach from PG session by creating a fresh instance
+                    state = row.__dict__.copy()
+                    state.pop('_sa_instance_state', None)
+                    new_row = table_class(**state)
+                    local_session.add(new_row)
                 await local_session.commit()
 
             print(f"  Synced {table_class.__tablename__}: {len(rows)} rows")
 
 
 async def push_table_to_postgres(table_class):
-    """Push one table from SQLite → PostgreSQL (called after admin writes)."""
+    """Push one table from SQLite → PostgreSQL (non-blocking, fire-and-forget)."""
     if engine_pg is None:
         return
+    asyncio.create_task(_push_table_impl(table_class))
 
-    async with AsyncSessionLocal() as local_session:
-        rows = (await local_session.execute(select(table_class))).scalars().all()
+async def _push_table_impl(table_class):
+    try:
+        async with AsyncSessionLocal() as local_session:
+            rows = (await local_session.execute(select(table_class))).scalars().all()
 
-    async with AsyncSessionPG() as pg_session:
-        await pg_session.execute(delete(table_class))
-        for row in rows:
-            pg_session.add(row)
-        await pg_session.commit()
+        async with AsyncSessionPG() as pg_session:
+            await pg_session.execute(delete(table_class))
+            for row in rows:
+                state = row.__dict__.copy()
+                state.pop('_sa_instance_state', None)
+                new_row = table_class(**state)
+                pg_session.add(new_row)
+            await pg_session.commit()
+    except Exception as e:
+        print(f"Push to PostgreSQL failed for {table_class.__tablename__}: {e}")
 
 
 # ─── Draft → Production sync ──────────────────────────────────────────
