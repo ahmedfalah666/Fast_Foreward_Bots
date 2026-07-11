@@ -1,0 +1,73 @@
+/**
+ * Nocturne + Silver Bullet - Brand Colors
+ * 
+ * This file defines the brand color palette as CSS custom properties (variables)
+ * and utility classes for text, backgrounds, and borders.
+ * 
+ * Palette Source: Vampire's Blood Color Scheme + Gold Accent
+ */
+
+:root {
+  /* ==========================================================================
+     Vampire's Blood Red Palette
+     ========================================================================== */
+  --brand-red-primary: #A41E14; /* Vampire Red (Bright/Medium Red) */
+  --brand-red-dark: #8D1703;    /* Crimson Red (Darker Rust Red) */
+  --brand-red-deep: #650F10;    /* Blood Maroon (Deepest Dark Red) */
+
+  /* ==========================================================================
+     Neutral Dark Palette
+     ========================================================================== */
+  --brand-black: #080808;       /* Rich Black (Deep Dark Background / Text) */
+  --brand-gray-dark: #373737;   /* Charcoal Gray (Dark Interface elements) */
+
+  /* ==========================================================================
+     Accent Palette
+     ========================================================================== */
+  --brand-gold: #FFC900;        /* Amber Gold (Highlights / Call-to-Actions) */
+
+  /* ==========================================================================
+     Brand Assets
+     ========================================================================== */
+  --brand-logo-url: url('./SilverBulletLogo.png'); /* Silver Bullet Logo Image Path */
+}
+
+/* ==========================================================================
+   Utility Classes - Text Colors
+   ========================================================================== */
+.text-brand-red-primary { color: var(--brand-red-primary); }
+.text-brand-red-dark    { color: var(--brand-red-dark); }
+.text-brand-red-deep    { color: var(--brand-red-deep); }
+.text-brand-black       { color: var(--brand-black); }
+.text-brand-gray-dark   { color: var(--brand-gray-dark); }
+.text-brand-gold        { color: var(--brand-gold); }
+
+/* ==========================================================================
+   Utility Classes - Background Colors
+   ========================================================================== */
+.bg-brand-red-primary { background-color: var(--brand-red-primary); }
+.bg-brand-red-dark    { background-color: var(--brand-red-dark); }
+.bg-brand-red-deep    { background-color: var(--brand-red-deep); }
+.bg-brand-black       { background-color: var(--brand-black); }
+.bg-brand-gray-dark   { background-color: var(--brand-gray-dark); }
+.bg-brand-gold        { background-color: var(--brand-gold); }
+
+/* ==========================================================================
+   Utility Classes - Border Colors
+   ========================================================================== */
+.border-brand-red-primary { border-color: var(--brand-red-primary); }
+.border-brand-red-dark    { border-color: var(--brand-red-dark); }
+.border-brand-red-deep    { border-color: var(--brand-red-deep); }
+.border-brand-black       { border-color: var(--brand-black); }
+.border-brand-gray-dark   { border-color: var(--brand-gray-dark); }
+.border-brand-gold        { border-color: var(--brand-gold); }
+
+/* ==========================================================================
+   Utility Classes - Brand Assets
+   ========================================================================== */
+.brand-logo-bg {
+  background-image: var(--brand-logo-url);
+  background-size: contain;
+  background-repeat: no-repeat;
+  background-position: center;
+}

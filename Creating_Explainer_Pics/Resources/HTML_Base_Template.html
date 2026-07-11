@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Silver Bullet Infographic Base - Final</title>
+    <style>
+        /* ==========================================================================
+           Custom Font Setup
+           ========================================================================== */
+        @font-face {
+            font-family: 'Calluna';
+            src: url('./Calluna-Regular.ttf') format('truetype');
+            font-weight: normal;
+            font-style: normal;
+        }
+
+        /* ==========================================================================
+           Brand Colors & Canvas Variables
+           ========================================================================== */
+        :root {
+            /* Vampire's Blood Red Palette */
+            --brand-red-primary: #A41E14;
+            --brand-red-dark: #8D1703;
+            --brand-red-deep: #650F10;
+
+            /* Neutral Dark Palette */
+            --brand-black: #080808;
+            --brand-gray-dark: #373737;
+
+            /* Accent Palette */
+            --brand-gold: #FFC900;
+
+            /* Canvas Base */
+            --canvas-white: #FAF9F6;
+        }
+
+        /* ==========================================================================
+           Document & Canvas Setup
+           ========================================================================== */
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #1A1A1A;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            font-family: 'Calluna', serif;
+        }
+
+        .canvas {
+            width: 800px;
+            height: 1200px;
+            background-color: var(--canvas-white);
+            box-sizing: border-box;
+            padding: 16px; 
+            position: relative;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.4);
+            overflow: hidden; /* Ensures watermark doesn't break out of the canvas */
+        }
+
+        /* Aesthetic Border Frame */
+        .border-frame {
+            border: 1px solid var(--brand-black);
+            height: 100%;
+            width: 100%;
+            box-sizing: border-box;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            padding: 24px 24px 16px 24px;
+            position: relative;
+            z-index: 1; /* Keeps frame layout structured */
+        }
+
+        .border-frame::before, .border-frame::after {
+            content: '';
+            position: absolute;
+            width: 10px;
+            height: 10px;
+            border-color: var(--brand-red-primary);
+            border-style: solid;
+            pointer-events: none;
+        }
+        .border-frame::before {
+            top: -5px;
+            left: -5px;
+            border-width: 1px 0 0 1px;
+        }
+        .border-frame::after {
+            bottom: -5px;
+            right: -5px;
+            border-width: 0 1px 1px 0;
+        }
+
+        /* ==========================================================================
+           Aesthetic Protection Watermark
+           ========================================================================== */
+        .watermark-overlay {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%) rotate(-35deg);
+            font-size: 5.5rem;
+            color: var(--brand-black);
+            opacity: 0.03; /* Extremely faint—visible enough to claim, subtle enough to ignore */
+            pointer-events: none; /* Clicks pass right through it to your content */
+            user-select: none; /* Cannot be highlighted or copied by cursor */
+            white-space: nowrap;
+            letter-spacing: 0.05em;
+            z-index: 100; /* Forces it to sit on top of all future artwork */
+        }
+
+        /* ==========================================================================
+           Maximal Content Area
+           ========================================================================== */
+        .main-content-area {
+            flex-grow: 1;
+            width: 100%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            border: 1px dashed rgba(8, 8, 8, 0.1); /* Temporary faint guide for your image boundaries */
+            background-color: transparent;
+            position: relative;
+        }
+
+        /* ==========================================================================
+           Footer Layout
+           ========================================================================== */
+        .footer {
+            width: 100%;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding-top: 14px;
+            margin-top: 12px;
+            border-top: 1px solid rgba(8, 8, 8, 0.1);
+            position: relative;
+        }
+
+        .footer::before {
+            content: '';
+            position: absolute;
+            top: -1px;
+            left: 0;
+            width: 40px;
+            height: 1px;
+            background-color: var(--brand-gold);
+        }
+
+        .footer-text {
+            font-size: 11px;
+            letter-spacing: 0.15em;
+            text-transform: uppercase;
+            margin: 0;
+        }
+
+        .footer-left {
+            color: var(--brand-black);
+            font-weight: bold;
+        }
+
+        .footer-right {
+            color: var(--brand-red-primary);
+        }
+
+    </style>
+</head>
+<body>
+
+    <div class="canvas">
+        
+        <!-- Stealth Overlay Watermark -->
+        <div class="watermark-overlay">@FastForward_Easy</div>
+
+        <div class="border-frame">
+            
+            <!-- Maximized Main Content Zone -->
+            <div class="main-content-area">
+                <!-- Drop your actual graphic content or image tags in here -->
+            </div>
+
+            <!-- Footer Zone -->
+            <div class="footer">
+                <p class="footer-text footer-left">Made By: Silver Bullet</p>
+                <p class="footer-text footer-right">Tele: @FastForward_Easy</p>
+            </div>
+
+        </div>
+    </div>
+
+</body>
+</html>

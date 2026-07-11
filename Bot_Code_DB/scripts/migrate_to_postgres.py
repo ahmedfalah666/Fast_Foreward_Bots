@@ -111,6 +111,20 @@ async def import_postgres():
 
         await session.commit()
 
+    # Fix autoincrement sequences (PostgreSQL sequences don't auto-update on manual inserts)
+    print("\nFixing sequences...")
+    from sqlalchemy import text
+    seq_tables = ["draft_menu_buttons", "credit_templates", "broadcasts", "broadcast_recipients"]
+    async with AsyncSessionLocal() as sess:
+        for table in seq_tables:
+            max_id = await sess.scalar(text(f"SELECT MAX(id) FROM {table}"))
+            if max_id is not None:
+                await sess.execute(text(f"SELECT setval('{table}_id_seq', {max_id})"))
+                print(f"  {table}: sequence set to {max_id}")
+            else:
+                print(f"  {table}: empty, skipped")
+        await sess.commit()
+
     print(f"\nOK: Imported {sum(len(data.get(t, [])) for t in TABLES)} total rows into PostgreSQL")
 
     await engine.dispose()
