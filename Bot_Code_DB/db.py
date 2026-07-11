@@ -1,14 +1,27 @@
 import asyncio
 import datetime
 import json
+import os
+import socket
+import time
 from datetime import timedelta
+import psycopg
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy import Column, Integer, BigInteger, String, Boolean, ForeignKey, DateTime, Text, select, delete, event
-from sqlalchemy.pool import NullPool
 from config import DATABASE_URL, ADMIN_IDS
 
-# ─── PostgreSQL engine (central source of truth for failover) ─────────
+# ─── Failover constants ────────────────────────────────────────────────
+LOCK_STALE_SECONDS = 30
+LOCK_INSTANCE_NAME = os.getenv("BOT_INSTANCE_NAME") or socket.gethostname()
+
+# ─── Raw PostgreSQL DSN (for sync operations) ─────────────────────────
+# Strip +asyncpg and sslmode params for psycopg
+_RAW_PG_DSN = (DATABASE_URL or "").strip()
+if "+asyncpg" in _RAW_PG_DSN:
+    _RAW_PG_DSN = _RAW_PG_DSN.replace("+asyncpg", "")
+
+# ─── PostgreSQL engine (async) ────────────────────────────────────────
 _pg_url = (DATABASE_URL or "").strip()
 if _pg_url and ("postgres://" in _pg_url or "postgresql://" in _pg_url):
     if _pg_url.startswith("postgres://"):
@@ -21,14 +34,14 @@ if _pg_url and ("postgres://" in _pg_url or "postgresql://" in _pg_url):
         _pg_url = _pg_url.replace("?sslmode=require", "").replace("&sslmode=require", "")
         _connect_args["ssl"] = "require"
 
-    engine_pg = create_async_engine(_pg_url, echo=False, connect_args=_connect_args or None, poolclass=NullPool)
+    engine_pg = create_async_engine(_pg_url, echo=False, connect_args=_connect_args or None)
     AsyncSessionPG = async_sessionmaker(bind=engine_pg, class_=AsyncSession, expire_on_commit=False)
 else:
     engine_pg = None
     AsyncSessionPG = None
 
 # ─── SQLite engine (fast local reads/writes) ──────────────────────────
-engine = create_async_engine("sqlite+aiosqlite:///bot_local.db", echo=False, poolclass=NullPool)
+engine = create_async_engine("sqlite+aiosqlite:///bot_local.db", echo=False)
 AsyncSessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 
 
@@ -196,6 +209,83 @@ async def _push_table_impl(table_class):
             await pg_session.commit()
     except Exception as e:
         print(f"Push to PostgreSQL failed for {table_class.__tablename__}: {e}")
+
+
+# ─── Synchronous lock operations (called BEFORE any async code) ──────
+
+def _sync_lock_dsn() -> str | None:
+    """Return a psycopg-compatible DSN from DATABASE_URL."""
+    raw = (DATABASE_URL or "").strip()
+    if not raw or ("postgres" not in raw and "postgresql" not in raw):
+        return None
+    raw = raw.replace("+asyncpg", "")
+    return raw
+
+
+def sync_ensure_lock_table():
+    """Create the bot_lock table if it doesn't exist (synchronous)."""
+    dsn = _sync_lock_dsn()
+    if not dsn:
+        return
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bot_lock (
+                    id INTEGER PRIMARY KEY,
+                    instance_name TEXT NOT NULL,
+                    last_heartbeat TIMESTAMP NOT NULL
+                )
+            """)
+        conn.commit()
+
+
+def sync_acquire_lock() -> bool:
+    """Atomically acquire the failover lock. Returns True if acquired.
+
+    Uses a single UPDATE with a WHERE guard — PostgreSQL serializes
+    this so two concurrent calls cannot both return True.
+    """
+    dsn = _sync_lock_dsn()
+    if not dsn:
+        return True  # No PG configured, always "acquired"
+
+    now = datetime.datetime.utcnow()
+    stale_before = now - timedelta(seconds=LOCK_STALE_SECONDS)
+
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO bot_lock (id, instance_name, last_heartbeat) "
+                "VALUES (1, %s, %s) ON CONFLICT DO NOTHING",
+                (LOCK_INSTANCE_NAME, now)
+            )
+            if cur.rowcount > 0:
+                conn.commit()
+                return True
+
+            cur.execute(
+                "UPDATE bot_lock SET instance_name = %s, last_heartbeat = %s "
+                "WHERE id = 1 AND (instance_name = %s OR last_heartbeat < %s)",
+                (LOCK_INSTANCE_NAME, now, LOCK_INSTANCE_NAME, stale_before)
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+
+def sync_release_lock():
+    """Mark the lock as stale so another instance can claim it."""
+    dsn = _sync_lock_dsn()
+    if not dsn:
+        return
+
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE bot_lock SET last_heartbeat = %s "
+                "WHERE id = 1 AND instance_name = %s",
+                (datetime.datetime.utcnow() - timedelta(seconds=3600), LOCK_INSTANCE_NAME)
+            )
+        conn.commit()
 
 
 # ─── Draft → Production sync ──────────────────────────────────────────

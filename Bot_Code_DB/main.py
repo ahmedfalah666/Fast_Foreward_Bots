@@ -1,11 +1,8 @@
 import asyncio
 import logging
-import os
-import socket
 import sys
-from datetime import datetime, timedelta
-
-from sqlalchemy import select
+import time
+from datetime import datetime
 
 # Windows compatibility: psycopg requires SelectorEventLoop
 if sys.platform == "win32":
@@ -22,7 +19,11 @@ from telegram.ext import (
 )
 
 from config import BOT_TOKEN
-from db import init_db, AsyncSessionLocal, AsyncSessionPG, BotLock, pull_from_postgres, push_table_to_postgres
+from db import (
+    init_db, AsyncSessionPG, BotLock, pull_from_postgres,
+    sync_ensure_lock_table, sync_acquire_lock, sync_release_lock,
+    LOCK_STALE_SECONDS, LOCK_INSTANCE_NAME,
+)
 from handlers.user import (
     start_command,
     user_menu_navigation,
@@ -77,51 +78,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── Failover Lock ────────────────────────────────────────────────────
-LOCK_STALE_SECONDS = 30
+# ─── Runtime state ────────────────────────────────────────────────────
 HEARTBEAT_INTERVAL = 10
-INSTANCE_NAME = os.getenv("BOT_INSTANCE_NAME") or socket.gethostname()
+INSTANCE_NAME = LOCK_INSTANCE_NAME
 _conflict_detected = False
-_application_ref = None  # Set in post_init, used by heartbeat to stop on conflict
-
-async def _try_acquire_lock() -> bool:
-    """Try to claim the singleton BotLock on PostgreSQL. Returns True if acquired."""
-    async with AsyncSessionPG() as session:
-        result = await session.execute(select(BotLock).where(BotLock.id == 1))
-        lock = result.scalars().first()
-        now = datetime.utcnow()
-
-        if lock is None:
-            session.add(BotLock(id=1, instance_name=INSTANCE_NAME, last_heartbeat=now))
-            await session.commit()
-            return True
-
-        stale = (now - lock.last_heartbeat).total_seconds() > LOCK_STALE_SECONDS
-        if lock.instance_name == INSTANCE_NAME or stale:
-            lock.instance_name = INSTANCE_NAME
-            lock.last_heartbeat = now
-            await session.commit()
-            return True
-
-        return False
-
-async def _release_lock():
-    """Mark the lock as stale so another instance can claim it."""
-    async with AsyncSessionPG() as session:
-        result = await session.execute(select(BotLock).where(BotLock.id == 1))
-        lock = result.scalars().first()
-        if lock and lock.instance_name == INSTANCE_NAME:
-            lock.last_heartbeat = datetime.utcnow() - timedelta(seconds=3600)
-            await session.commit()
+_application_ref = None
 
 async def _heartbeat_loop():
-    """Background task: update last_heartbeat on PostgreSQL every HEARTBEAT_INTERVAL seconds."""
+    """Background task: update last_heartbeat via async PG every HEARTBEAT_INTERVAL seconds."""
     global _conflict_detected
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL)
         if _conflict_detected:
             logger.warning("409 Conflict detected — releasing lock and stopping")
-            await _release_lock()
+            sync_release_lock()
             app = _application_ref
             if app:
                 await app.stop()
@@ -199,23 +169,13 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             logger.error(f"Failed to send error notification to admin {admin_id}: {notify_err}")
 
 async def post_init(application: Application):
-    """Initialize DB, acquire lock, sync from PG, start heartbeat, set commands."""
+    """Sync from PG, start heartbeat, set bot commands."""
     global _application_ref, _conflict_detected
     _application_ref = application
     _conflict_detected = False
 
     await init_db()
     logger.info("Database initialized successfully.")
-
-    # ── Acquire failover lock ──
-    logger.info(f"Instance: {INSTANCE_NAME} — acquiring failover lock...")
-    while True:
-        acquired = await _try_acquire_lock()
-        if acquired:
-            logger.info("Lock acquired — this instance is now active")
-            break
-        logger.info("Lock held by another instance — retrying in 10s...")
-        await asyncio.sleep(10)
 
     # ── Sync from PostgreSQL → SQLite ──
     logger.info("Pulling data from PostgreSQL into local SQLite...")
@@ -239,10 +199,32 @@ async def post_init(application: Application):
     logger.info("Bot commands set successfully.")
 
 async def post_shutdown(application: Application):
-    """Releases the failover lock on shutdown."""
-    logger.info("Releasing failover lock...")
-    await _release_lock()
-    logger.info("Failover lock released.")
+    """Cleanup on shutdown."""
+    logger.info("Application shutting down.")
+
+
+def _preflight_probe() -> bool:
+    """Quick Telegram getUpdates call to verify no other instance is polling.
+
+    If we get 409 Conflict, another instance is alive — we must back off.
+    If we get 200 OK, it's safe to start polling.
+    The probe itself interrupts any existing polling connection.
+    """
+    import httpx
+    try:
+        r = httpx.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
+            json={"limit": 1, "timeout": 1, "offset": -1},
+            timeout=5,
+        )
+        if r.status_code == 409:
+            logger.warning("Preflight probe got 409 — another instance is still polling")
+            return False
+        return True
+    except Exception as e:
+        logger.warning(f"Preflight probe failed: {e}")
+        return False
+
 
 def _build_application():
     """Build and return the Application with all handlers registered."""
@@ -306,27 +288,53 @@ def _build_application():
     application.add_error_handler(error_handler)
     return application
 
+
 def main():
-    """Starts the Telegram bot with failover support."""
+    """Starts the Telegram bot with failover support.
+
+    Flow: sync lock → preflight probe → asyncio.run(app) → release → loop
+    """
     if not BOT_TOKEN:
-        logger.error("❌ BOT_TOKEN is missing! Please set it in your environment or .env file.")
+        logger.error("❌ BOT_TOKEN is missing!")
         sys.exit(1)
 
-    while True:
-        logger.info("Starting Telegram Bot Application...")
-        application = _build_application()
+    # Ensure the bot_lock table exists (for sync lock ops)
+    sync_ensure_lock_table()
 
+    while True:
+        # ── Step 1: Acquire the failover lock atomically (synchronous) ──
+        logger.info(f"Instance: {INSTANCE_NAME} — acquiring failover lock...")
+        if not sync_acquire_lock():
+            logger.info("Lock held by another instance — retrying in 10s...")
+            time.sleep(10)
+            continue
+        logger.info("Lock acquired — this instance is now active")
+
+        # ── Step 2: Pre-flight Telegram probe ──
+        logger.info("Probing Telegram for active polling connections...")
+        if not _preflight_probe():
+            logger.warning("Another instance is still polling — releasing lock and retrying in 30s")
+            sync_release_lock()
+            time.sleep(30)
+            continue
+        logger.info("No conflict detected, starting bot...")
+
+        # ── Step 3: Run the async application ──
+        application = _build_application()
         try:
             application.run_polling(allowed_updates=Update.ALL_TYPES)
         except Exception as e:
             logger.error(f"Application stopped with error: {e}")
 
+        # ── Step 4: Release lock and loop ──
+        sync_release_lock()
+
         if _conflict_detected:
-            logger.info("Standby — lock released due to conflict, retrying in 10s...")
-            asyncio.run(asyncio.sleep(10))
+            logger.info("Standby — conflict was detected during polling, retrying in 10s...")
+            time.sleep(10)
             continue
 
-        logger.info("Bot stopped. Exiting.")
+        logger.info("Bot stopped normally. Exiting.")
         break
 
 if __name__ == "__main__":
