@@ -1,5 +1,15 @@
+import asyncio
 import logging
+import os
+import socket
 import sys
+from datetime import datetime, timedelta
+
+from sqlalchemy import select
+
+# Windows compatibility: psycopg requires SelectorEventLoop
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 from telegram import Update, BotCommand
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -12,7 +22,7 @@ from telegram.ext import (
 )
 
 from config import BOT_TOKEN
-from db import init_db
+from db import init_db, AsyncSessionLocal, BotLock
 from handlers.user import (
     start_command,
     user_menu_navigation,
@@ -38,7 +48,23 @@ from handlers.admin import (
     admin_color_click,
     admin_set_color_execute,
     admin_add_style_selection,
-    admin_edit_link_click
+    admin_edit_link_click,
+    admin_move_to_click,
+    admin_move_to_nav,
+    admin_move_to_select,
+    admin_copy_click,
+    admin_copy_nav,
+    admin_copy_execute,
+    admin_add_more_file,
+    admin_finish_files,
+    admin_source_manage,
+    admin_source_replace,
+    admin_source_delete,
+    admin_source_add,
+    admin_edit_credit_click,
+    admin_edit_credit_skip,
+    users_command,
+    users_page_callback
 )
 
 # Setup Logging
@@ -50,6 +76,56 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# ─── Failover Lock ────────────────────────────────────────────────────
+LOCK_STALE_SECONDS = 30
+HEARTBEAT_INTERVAL = 10
+INSTANCE_NAME = os.getenv("BOT_INSTANCE_NAME") or socket.gethostname()
+logger = logging.getLogger(__name__)
+
+async def _try_acquire_lock() -> bool:
+    """Try to claim the singleton BotLock. Returns True if acquired."""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(BotLock).where(BotLock.id == 1))
+        lock = result.scalars().first()
+        now = datetime.utcnow()
+
+        if lock is None:
+            session.add(BotLock(id=1, instance_name=INSTANCE_NAME, last_heartbeat=now))
+            await session.commit()
+            return True
+
+        stale = (now - lock.last_heartbeat).total_seconds() > LOCK_STALE_SECONDS
+        if lock.instance_name == INSTANCE_NAME or stale:
+            lock.instance_name = INSTANCE_NAME
+            lock.last_heartbeat = now
+            await session.commit()
+            return True
+
+        return False
+
+async def _release_lock():
+    """Mark the lock as stale so another instance can claim it."""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(BotLock).where(BotLock.id == 1))
+        lock = result.scalars().first()
+        if lock and lock.instance_name == INSTANCE_NAME:
+            lock.last_heartbeat = datetime.utcnow() - timedelta(seconds=3600)
+            await session.commit()
+
+async def _heartbeat_loop():
+    """Background task: update last_heartbeat every HEARTBEAT_INTERVAL seconds."""
+    while True:
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+        try:
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(select(BotLock).where(BotLock.id == 1))
+                lock = result.scalars().first()
+                if lock and lock.instance_name == INSTANCE_NAME:
+                    lock.last_heartbeat = datetime.utcnow()
+                    await session.commit()
+        except Exception as e:
+            logger.error(f"Heartbeat error: {e}")
 
 async def route_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -111,17 +187,38 @@ async def post_init(application: Application):
     logger.info("Initializing database tables...")
     await init_db()
     logger.info("Database initialized successfully.")
-    
+
+    # ── Acquire failover lock ──
+    logger.info(f"Instance: {INSTANCE_NAME} — acquiring failover lock...")
+    while True:
+        acquired = await _try_acquire_lock()
+        if acquired:
+            logger.info("Lock acquired — this instance is now active")
+            break
+        logger.info("Lock held by another instance — retrying in 10s...")
+        await asyncio.sleep(10)
+
+    # ── Start heartbeat ──
+    asyncio.create_task(_heartbeat_loop())
+    logger.info("Heartbeat task started")
+
     # Register Bot Commands
     logger.info("Setting bot command autocomplete menu...")
     commands = [
         BotCommand("start", "Start the bot & open main menu"),
         BotCommand("admin", "Open admin staging editor"),
         BotCommand("broadcast", "Broadcast message (admin only)"),
-        BotCommand("broadcasts", "List & manage sent broadcasts (admin only)")
+        BotCommand("broadcasts", "List & manage sent broadcasts (admin only)"),
+        BotCommand("users", "List all registered users (admin only)")
     ]
     await application.bot.set_my_commands(commands)
     logger.info("Bot commands set successfully.")
+
+async def post_shutdown(application: Application):
+    """Releases the failover lock on shutdown."""
+    logger.info("Releasing failover lock...")
+    await _release_lock()
+    logger.info("Failover lock released.")
 
 def main():
     """Starts the Telegram bot."""
@@ -132,13 +229,14 @@ def main():
     logger.info("Starting Telegram Bot Application...")
     
     # Initialize application
-    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    application = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
     
     # Register Commands
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
     application.add_handler(CommandHandler("broadcasts", broadcasts_command))
+    application.add_handler(CommandHandler("users", users_command))
     
     # Register Production (User) Callback Handlers
     application.add_handler(CallbackQueryHandler(user_menu_navigation, pattern=r"^(m|b):"))
@@ -162,8 +260,35 @@ def main():
     application.add_handler(CallbackQueryHandler(admin_add_style_selection, pattern=r"^add_style:"))
     application.add_handler(CallbackQueryHandler(admin_edit_link_click, pattern=r"^edit_link:"))
     
+    # Move-to-parent handlers
+    application.add_handler(CallbackQueryHandler(admin_move_to_click, pattern=r"^parent_sel:"))
+    application.add_handler(CallbackQueryHandler(admin_move_to_nav, pattern=r"^parent_nav:"))
+    application.add_handler(CallbackQueryHandler(admin_move_to_select, pattern=r"^parent_pick:"))
+    
+    # Copy menu contents handlers
+    application.add_handler(CallbackQueryHandler(admin_copy_click, pattern=r"^copy_sel:"))
+    application.add_handler(CallbackQueryHandler(admin_copy_nav, pattern=r"^copy_nav:"))
+    application.add_handler(CallbackQueryHandler(admin_copy_execute, pattern=r"^copy_pick:"))
+    
+    # Multi-file add flow handlers
+    application.add_handler(CallbackQueryHandler(admin_add_more_file, pattern=r"^add_more_file$"))
+    application.add_handler(CallbackQueryHandler(admin_finish_files, pattern=r"^add_finish_files$"))
+    
+    # Source management handlers
+    application.add_handler(CallbackQueryHandler(admin_source_manage, pattern=r"^src_manage:"))
+    application.add_handler(CallbackQueryHandler(admin_source_replace, pattern=r"^src_replace:"))
+    application.add_handler(CallbackQueryHandler(admin_source_delete, pattern=r"^src_del:"))
+    application.add_handler(CallbackQueryHandler(admin_source_add, pattern=r"^src_add:"))
+    
+    # Edit credits handlers
+    application.add_handler(CallbackQueryHandler(admin_edit_credit_click, pattern=r"^edit_credit:"))
+    application.add_handler(CallbackQueryHandler(admin_edit_credit_skip, pattern=r"^edit_credit_skip:"))
+    
     # Broadcast management handlers
     application.add_handler(CallbackQueryHandler(broadcast_action_handler, pattern=r"^(bedit|bdelete|bdel_yes|bdel_cancel):"))
+    
+    # Users list pagination
+    application.add_handler(CallbackQueryHandler(users_page_callback, pattern=r"^users_page:"))
     
     # Register generic message handler for text/file inputs
     application.add_handler(

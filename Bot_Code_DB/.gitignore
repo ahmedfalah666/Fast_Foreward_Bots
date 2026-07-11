@@ -1,0 +1,9 @@
+.env
+*.db
+__pycache__/
+*.pyc
+errors.log
+.railway/
+scripts/migration_export.json
+bot_output.log
+bot_error.log

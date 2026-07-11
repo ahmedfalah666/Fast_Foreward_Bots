@@ -1,8 +1,13 @@
+import re
+import json
+from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageOriginChannel, MessageOriginChat
+from telegram.error import BadRequest, TelegramError
+from telegram.helpers import escape_markdown
 from telegram.ext import ContextTypes
 from sqlalchemy import select, delete
 from db import AsyncSessionLocal, User, DraftMenuButton, Broadcast, BroadcastRecipient, sync_draft_to_production
-from keyboards import build_menu_keyboard, build_button_edit_keyboard, build_color_picker_keyboard
+from keyboards import build_menu_keyboard, build_button_edit_keyboard, build_color_picker_keyboard, build_parent_selector_keyboard, build_copy_source_keyboard, build_sources_manage_keyboard
 from config import ADMIN_IDS, STORAGE_CHANNEL_ID
 
 async def check_admin(user_id: int) -> bool:
@@ -71,18 +76,21 @@ async def show_admin_edit_panel(message_or_query, btn_id: int):
         
     keyboard = await build_button_edit_keyboard(btn_id)
     style_display = btn.button_style.upper() if btn.button_style else "DEFAULT (GRAY)"
+    safe_title = escape_markdown(btn.title or "", version=1)
     
     if btn.button_type == "menu":
         dest_display = "Submenu Directory Folder"
     elif btn.button_type == "link":
-        dest_display = f"Forwarded File (Msg ID: {btn.source_message_id})"
+        extra = json.loads(btn.extra_sources) if btn.extra_sources else []
+        total = 1 + len(extra)
+        dest_display = f"{total} file(s) — Primary ID: {btn.source_message_id}"
     else:
         dest_display = f"Redirect URL: {btn.credit_text}"
         
     details_text = (
         "✦ ─── ⚜️ ─── ✦\n"
         "*BUTTON CONTROL PANEL*\n\n"
-        f"• *Label:* {btn.title}\n"
+        f"• *Label:* {safe_title}\n"
         f"• *Type:* `{btn.button_type.upper()}`\n"
         f"• *Background Color:* `{style_display}`\n"
         f"• *Destination:* `{dest_display}`\n"
@@ -255,6 +263,9 @@ async def admin_reorder_execute(update: Update, context: ContextTypes.DEFAULT_TY
     direction = parts[1]  # 'up' or 'down'
     btn_id = int(parts[2])
     
+    parent_id = None
+    reordered = False
+
     async with AsyncSessionLocal() as session:
         stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
         res = await session.execute(stmt)
@@ -278,12 +289,17 @@ async def admin_reorder_execute(update: Update, context: ContextTypes.DEFAULT_TY
             siblings[active_idx].order_index = active_idx - 1
             siblings[active_idx - 1].order_index = active_idx
             await session.commit()
+            reordered = True
         elif direction == "down" and active_idx < len(siblings) - 1:
             siblings[active_idx].order_index = active_idx + 1
             siblings[active_idx + 1].order_index = active_idx
             await session.commit()
-            
-    await show_admin_edit_panel(query, btn_id)
+            reordered = True
+
+    if reordered:
+        await show_admin_manage_mode(query, parent_id)
+    else:
+        await query.answer("↕️ Already at the edge")
 
 async def admin_edit_back_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -327,12 +343,38 @@ async def admin_add_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+def _parse_message_link(text: str) -> tuple[str | int | None, int | None]:
+    """Parse a Telegram message link into (chat_id_or_username, message_id).
+    
+    Returns (chat_id, message_id) on success, (None, None) otherwise.
+    For public links returns (username_str, message_id) — caller resolves to chat_id.
+    
+    Supports:
+      - t.me/username/1234  or  https://t.me/username/1234
+      - t.me/c/123456789/1234  or  https://t.me/c/123456789/1234
+    """
+    text = text.strip()
+    
+    # Private channel: t.me/c/123456789/1234
+    m = re.match(r"(?:https?://)?t\.me/c/(\d+)/(\d+)", text)
+    if m:
+        chat_id = int(f"-100{m.group(1)}")
+        return chat_id, int(m.group(2))
+    
+    # Public channel/user: t.me/username/1234
+    m2 = re.match(r"(?:https?://)?t\.me/([a-zA-Z0-9_]{5,})/(\d+)", text)
+    if m2:
+        return m2.group(1), int(m2.group(2))
+    
+    return None, None
+
 async def _resolve_source_for_link(update, context):
     """
     Resolves (source_chat_id, source_message_id) for a link button.
     Always stores content in the storage channel for reliable delivery.
 
     Priority:
+    0. Admin pastes a Telegram message link → resolve and copy from source
     1. Forward origin (MessageOriginChannel / MessageOriginChat)
        → copy original content directly from source chat to storage channel
     2. Admin's own message text/file
@@ -340,6 +382,39 @@ async def _resolve_source_for_link(update, context):
 
     Returns (chat_id, message_id) on success, (None, None) on failure.
     """
+    # Priority 0: admin sent a Telegram message link as text
+    if update.message.text and STORAGE_CHANNEL_ID:
+        from_chat_id, from_msg_id = _parse_message_link(update.message.text)
+        if from_msg_id is not None:
+            # If it's a public link (username string), resolve to chat_id
+            if isinstance(from_chat_id, str):
+                try:
+                    chat = await context.bot.get_chat(f"@{from_chat_id}")
+                    from_chat_id = chat.id
+                except Exception as e:
+                    await update.message.reply_text(
+                        f"❌ Could not resolve channel @{from_chat_id}: {str(e)}"
+                    )
+                    return None, None
+
+            # If the linked message is already in the storage channel, no copy needed
+            if from_chat_id == STORAGE_CHANNEL_ID:
+                return STORAGE_CHANNEL_ID, from_msg_id
+
+            try:
+                copied = await context.bot.copy_message(
+                    chat_id=STORAGE_CHANNEL_ID,
+                    from_chat_id=from_chat_id,
+                    message_id=from_msg_id
+                )
+                return STORAGE_CHANNEL_ID, copied.message_id
+            except Exception as e:
+                await update.message.reply_text(
+                    f"❌ Could not copy from the linked message: {str(e)}\n"
+                    "Make sure the bot has access to the source channel."
+                )
+                return None, None
+
     # Priority 1: forwarded from a channel or group
     if update.message.forward_origin and STORAGE_CHANNEL_ID:
         origin = update.message.forward_origin
@@ -347,10 +422,10 @@ async def _resolve_source_for_link(update, context):
         from_msg_id = None
         if isinstance(origin, MessageOriginChannel):
             from_chat_id = origin.chat.id
-            from_msg_id = origin.message_id
+            from_msg_id = getattr(origin, 'message_id', None)
         elif isinstance(origin, MessageOriginChat):
             from_chat_id = origin.sender_chat.id
-            from_msg_id = origin.message_id
+            from_msg_id = getattr(origin, 'message_id', None)
 
         if from_chat_id and from_msg_id:
             try:
@@ -534,16 +609,36 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         context.user_data["new_btn_chat_id"] = chat_id
         context.user_data["new_btn_message_id"] = msg_id
+        context.user_data["extra_sources"] = []
         
-        context.user_data["admin_state"] = "waiting_for_credit"
+        context.user_data["admin_state"] = "add_more_prompt"
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ No Credits", callback_data="add_no_credits")]
+            [InlineKeyboardButton("➕ Add Another File", callback_data="add_more_file")],
+            [InlineKeyboardButton("✅ Finish — Set Credits", callback_data="add_finish_files")]
         ])
         await update.message.reply_text(
-            "📝 Enter credits/source (e.g. '@username' or channel link), or click below to skip:",
+            "✅ File saved! You can add more files or finish and set credits:",
             reply_markup=keyboard
         )
         
+    elif admin_state == "waiting_for_more_file":
+        chat_id, msg_id = await _resolve_source_for_link(update, context)
+        if not chat_id or not msg_id:
+            return
+
+        extra_list = context.user_data.setdefault("extra_sources", [])
+        extra_list.append({"chat_id": chat_id, "message_id": msg_id})
+
+        context.user_data["admin_state"] = "add_more_prompt"
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Add Another File", callback_data="add_more_file")],
+            [InlineKeyboardButton("✅ Finish — Set Credits", callback_data="add_finish_files")]
+        ])
+        await update.message.reply_text(
+            f"✅ File {len(extra_list) + 1} saved! Add more or finish:",
+            reply_markup=keyboard
+        )
+
     elif admin_state == "waiting_for_credit":
         text = update.message.text
         context.user_data["new_btn_credit_text"] = text
@@ -555,6 +650,89 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "🎨 Select a background color style for this button:",
             reply_markup=keyboard
         )
+
+    elif admin_state == "waiting_replace_primary":
+        btn_id = context.user_data["edit_btn_id"]
+        chat_id, msg_id = await _resolve_source_for_link(update, context)
+        if not chat_id or not msg_id:
+            return
+
+        async with AsyncSessionLocal() as session:
+            stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
+            res = await session.execute(stmt)
+            btn = res.scalars().first()
+            if btn:
+                btn.source_chat_id = chat_id
+                btn.source_message_id = msg_id
+                await session.commit()
+
+        context.user_data.clear()
+        await update.message.reply_text("✅ Primary source replaced!")
+        async with AsyncSessionLocal() as session:
+            stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
+            res = await session.execute(stmt)
+            btn = res.scalars().first()
+        if btn:
+            extra = json.loads(btn.extra_sources) if btn.extra_sources else []
+            keyboard = await build_sources_manage_keyboard(btn_id)
+            await update.message.reply_text(
+                f"📂 *Sources for:* {escape_markdown(btn.title or '', version=1)}\n\n"
+                f"Primary: 1 file\n"
+                f"Extra: {len(extra)} file(s)\n\n"
+                "Tap a source to replace/delete it, or add a new one:",
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+
+    elif admin_state == "waiting_add_source":
+        btn_id = context.user_data["edit_btn_id"]
+        chat_id, msg_id = await _resolve_source_for_link(update, context)
+        if not chat_id or not msg_id:
+            return
+
+        async with AsyncSessionLocal() as session:
+            stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
+            res = await session.execute(stmt)
+            btn = res.scalars().first()
+            if btn:
+                extra = json.loads(btn.extra_sources) if btn.extra_sources else []
+                extra.append({"chat_id": chat_id, "message_id": msg_id})
+                btn.extra_sources = json.dumps(extra)
+                await session.commit()
+
+        context.user_data.clear()
+        await update.message.reply_text("✅ Extra source added!")
+        async with AsyncSessionLocal() as session:
+            stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
+            res = await session.execute(stmt)
+            btn = res.scalars().first()
+        if btn:
+            extra = json.loads(btn.extra_sources) if btn.extra_sources else []
+            keyboard = await build_sources_manage_keyboard(btn_id)
+            await update.message.reply_text(
+                f"📂 *Sources for:* {escape_markdown(btn.title or '', version=1)}\n\n"
+                f"Primary: 1 file\n"
+                f"Extra: {len(extra)} file(s)\n\n"
+                "Tap a source to replace/delete it, or add a new one:",
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+
+    elif admin_state == "waiting_edit_credit":
+        btn_id = context.user_data["edit_btn_id"]
+        text = update.message.text
+
+        async with AsyncSessionLocal() as session:
+            stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
+            res = await session.execute(stmt)
+            btn = res.scalars().first()
+            if btn:
+                btn.credit_text = text
+                await session.commit()
+
+        context.user_data.clear()
+        await update.message.reply_text("✅ Credits updated!")
+        await show_admin_edit_panel(update.message, btn_id)
 
 async def admin_add_skip_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the 'No Credits' callback click during adding."""
@@ -575,6 +753,14 @@ async def admin_add_skip_credits(update: Update, context: ContextTypes.DEFAULT_T
         "🎨 Select a background color style for this button:",
         reply_markup=keyboard
     )
+
+async def admin_edit_credit_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the 'Skip / Keep Current' callback during credit editing."""
+    query = update.callback_query
+    await query.answer("Keeping current credits.")
+    btn_id = int(query.data.split(":")[1])
+    context.user_data.clear()
+    await show_admin_edit_panel(query, btn_id)
 
 async def admin_add_style_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles style background color selection and saves the new button."""
@@ -610,6 +796,9 @@ async def save_button_to_db(context: ContextTypes.DEFAULT_TYPE):
         sibling_buttons = res.scalars().all()
         next_order = len(sibling_buttons)
         
+        extra_list = context.user_data.get("extra_sources", [])
+        extra_json = json.dumps(extra_list) if extra_list else None
+
         new_btn = DraftMenuButton(
             parent_id=parent_id,
             title=title,
@@ -618,7 +807,8 @@ async def save_button_to_db(context: ContextTypes.DEFAULT_TYPE):
             button_style=context.user_data.get("new_btn_style"),
             source_chat_id=context.user_data.get("new_btn_chat_id"),
             source_message_id=context.user_data.get("new_btn_message_id"),
-            credit_text=context.user_data.get("new_btn_credit_text")
+            credit_text=context.user_data.get("new_btn_credit_text"),
+            extra_sources=extra_json
         )
         session.add(new_btn)
         await session.commit()
@@ -653,6 +843,400 @@ async def admin_delete_click(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await show_admin_manage_mode(query, parent_id)
         else:
             await _safe_reply(query, "❌ Button not found in database.")
+
+async def _get_descendant_ids(session, parent_id: int) -> set[int]:
+    """Recursively collect all descendant button IDs under a menu button."""
+    stmt = select(DraftMenuButton).where(DraftMenuButton.parent_id == parent_id)
+    res = await session.execute(stmt)
+    children = res.scalars().all()
+    ids = set()
+    for child in children:
+        ids.add(child.id)
+        ids.update(await _get_descendant_ids(session, child.id))
+    return ids
+
+async def admin_move_to_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Opens the parent-selector tree (parent_sel:<btn_id>)."""
+    query = update.callback_query
+    await query.answer()
+
+    btn_id = int(query.data.split(":")[1])
+
+    async with AsyncSessionLocal() as session:
+        stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
+        res = await session.execute(stmt)
+        btn = res.scalars().first()
+
+        if not btn:
+            await _safe_reply(query, "❌ Button not found.")
+            return
+
+        # Build set of excluded IDs (the button itself + all its descendants)
+        exclude = {btn_id}
+        if btn.button_type == "menu":
+            exclude.update(await _get_descendant_ids(session, btn_id))
+
+    keyboard = await build_parent_selector_keyboard(None, btn_id, exclude)
+    safe_title = escape_markdown(btn.title or "", version=1)
+    await query.edit_message_text(
+        f"📂 *Move Button to Another Folder*\n\n"
+        f"Button: *{safe_title}*\n"
+        f"Type: `{btn.button_type.upper()}`\n\n"
+        "Navigate to the destination folder and tap \"Select This Folder\":",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+async def admin_move_to_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Navigates the parent-selector tree (parent_nav:<parent>:<btn_id>)."""
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split(":")
+    current_raw = parts[1]
+    btn_id = int(parts[2])
+
+    current_parent = None if current_raw == "root" else int(current_raw)
+
+    async with AsyncSessionLocal() as session:
+        stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
+        res = await session.execute(stmt)
+        btn = res.scalars().first()
+
+        if not btn:
+            await _safe_reply(query, "❌ Button not found.")
+            return
+
+        exclude = {btn_id}
+        if btn.button_type == "menu":
+            exclude.update(await _get_descendant_ids(session, btn_id))
+
+    keyboard = await build_parent_selector_keyboard(current_parent, btn_id, exclude)
+
+    location = "Main Menu (Root)"
+    if current_parent is not None:
+        async with AsyncSessionLocal() as session2:
+            stmt2 = select(DraftMenuButton).where(DraftMenuButton.id == current_parent)
+            res2 = await session2.execute(stmt2)
+            parent_btn = res2.scalars().first()
+            if parent_btn:
+                location = parent_btn.title
+
+    safe_title = escape_markdown(btn.title or "", version=1)
+    await query.edit_message_text(
+        f"📂 *Move Button — {location}*\n\n"
+        f"Button: *{safe_title}*\n\n"
+        "Navigate to the destination folder and tap \"Select This Folder\":",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+async def admin_move_to_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirms the new parent and updates the DB (parent_pick:<parent>:<btn_id>)."""
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split(":")
+    parent_raw = parts[1]
+    btn_id = int(parts[2])
+
+    new_parent = None if parent_raw == "root" else int(parent_raw)
+
+    async with AsyncSessionLocal() as session:
+        stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
+        res = await session.execute(stmt)
+        btn = res.scalars().first()
+
+        if not btn:
+            await _safe_reply(query, "❌ Button not found.")
+            return
+
+        old_parent = btn.parent_id
+
+        # Safety: no-op if same parent
+        if btn.parent_id == new_parent:
+            await query.edit_message_text(
+                f"⚠️ That button is already in that folder. No change made.",
+                parse_mode="Markdown"
+            )
+            return
+
+        # Move the button: update parent_id and append at end of new sibling list
+        stmt_count = select(DraftMenuButton).where(DraftMenuButton.parent_id == new_parent)
+        res_count = await session.execute(stmt_count)
+        new_siblings = res_count.scalars().all()
+        btn.parent_id = new_parent
+        btn.order_index = len(new_siblings)
+
+        # Re-index old siblings to close the gap
+        stmt_old = select(DraftMenuButton).where(DraftMenuButton.parent_id == old_parent).order_by(DraftMenuButton.order_index)
+        res_old = await session.execute(stmt_old)
+        old_siblings = res_old.scalars().all()
+        for idx, s in enumerate(old_siblings):
+            s.order_index = idx
+
+        await session.commit()
+
+    parent_name = "Main Menu (Root)"
+    if new_parent is not None:
+        async with AsyncSessionLocal() as session2:
+            stmt2 = select(DraftMenuButton).where(DraftMenuButton.id == new_parent)
+            res2 = await session2.execute(stmt2)
+            p = res2.scalars().first()
+            if p:
+                parent_name = p.title
+
+    safe_title = escape_markdown(btn.title or "", version=1)
+    await query.edit_message_text(
+        f"✅ *{safe_title}* moved to *{parent_name}* successfully!",
+        parse_mode="Markdown"
+    )
+
+    # Return to manage mode at the new parent level
+    await show_admin_manage_mode(query, new_parent)
+
+async def admin_copy_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Opens the source-menu selector tree (copy_sel:<target_parent>)."""
+    query = update.callback_query
+    await query.answer()
+
+    target_raw = query.data.split(":")[1]
+    target_parent = None if target_raw == "root" else int(target_raw)
+
+    keyboard = await build_copy_source_keyboard(None, target_parent)
+    await query.edit_message_text(
+        "📋 *Copy Contents From Another Menu*\n\n"
+        "Navigate to the menu you want to copy buttons from and tap \"Select This Folder\":",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+async def admin_copy_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Navigates the source-selector tree (copy_nav:<source_parent>:<target>)."""
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split(":")
+    current_raw = parts[1]
+    target_raw = parts[2]
+
+    current_parent = None if current_raw == "root" else int(current_raw)
+    target_parent = None if target_raw == "root" else int(target_raw)
+
+    keyboard = await build_copy_source_keyboard(current_parent, target_parent)
+
+    location = "Main Menu (Root)"
+    if current_parent is not None:
+        async with AsyncSessionLocal() as session:
+            stmt = select(DraftMenuButton).where(DraftMenuButton.id == current_parent)
+            res = await session.execute(stmt)
+            p = res.scalars().first()
+            if p:
+                location = p.title
+
+    await query.edit_message_text(
+        f"📋 *Copy Contents — {location}*\n\n"
+        "Navigate to the source menu and tap \"Select This Folder\":",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+async def admin_copy_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Copies all buttons from source menu to target menu (copy_pick:<source>:<target>)."""
+    query = update.callback_query
+    await query.answer("Copying...")
+
+    parts = query.data.split(":")
+    source_raw = parts[1]
+    target_raw = parts[2]
+
+    source_parent = None if source_raw == "root" else int(source_raw)
+    target_parent = None if target_raw == "root" else int(target_raw)
+
+    if source_parent == target_parent:
+        await query.edit_message_text("⚠️ Source and target are the same. No buttons copied.")
+        return
+
+    async with AsyncSessionLocal() as session:
+        # Fetch source buttons
+        stmt = select(DraftMenuButton).where(
+            DraftMenuButton.parent_id == source_parent
+        ).order_by(DraftMenuButton.order_index)
+        res = await session.execute(stmt)
+        source_buttons = res.scalars().all()
+
+        if not source_buttons:
+            await query.edit_message_text("⚠️ Source menu has no buttons to copy.")
+            return
+
+        # Fetch existing target buttons to compute starting order_index
+        stmt_t = select(DraftMenuButton).where(
+            DraftMenuButton.parent_id == target_parent
+        ).order_by(DraftMenuButton.order_index)
+        res_t = await session.execute(stmt_t)
+        target_buttons = res_t.scalars().all()
+        next_order = len(target_buttons)
+
+        # Copy each source button as a new button under target
+        for src in source_buttons:
+            new_btn = DraftMenuButton(
+                parent_id=target_parent,
+                title=src.title,
+                button_type=src.button_type,
+                order_index=next_order,
+                button_style=src.button_style,
+                source_chat_id=src.source_chat_id,
+                source_message_id=src.source_message_id,
+                credit_text=src.credit_text
+            )
+            session.add(new_btn)
+            next_order += 1
+
+        await session.commit()
+
+    source_name = "Main Menu (Root)"
+    if source_parent is not None:
+        async with AsyncSessionLocal() as session2:
+            stmt2 = select(DraftMenuButton).where(DraftMenuButton.id == source_parent)
+            res2 = await session2.execute(stmt2)
+            s = res2.scalars().first()
+            if s:
+                source_name = s.title
+
+    await query.edit_message_text(
+        f"✅ Successfully copied `{len(source_buttons)}` button(s) from *{source_name}*!",
+        parse_mode="Markdown"
+    )
+
+    await show_admin_manage_mode(query, target_parent)
+
+# ─── Multi-file add flow callbacks ───────────────────────────────────
+
+async def admin_add_more_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Switches to waiting_for_more_file (add_more_file)."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data["admin_state"] = "waiting_for_more_file"
+    await _safe_reply(query, "📂 Please forward or send the next file:")
+
+async def admin_finish_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Proceeds to credits input (add_finish_files)."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data["admin_state"] = "waiting_for_credit"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ No Credits", callback_data="add_no_credits")]
+    ])
+    await _safe_reply(
+        query,
+        "📝 Enter credits/source (e.g. '@username' or channel link), or click below to skip:",
+        reply_markup=keyboard
+    )
+
+# ─── Source management handlers ──────────────────────────────────────
+
+async def admin_source_manage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Opens the sources management view (src_manage:<btn_id>)."""
+    query = update.callback_query
+    await query.answer()
+    btn_id = int(query.data.split(":")[1])
+
+    async with AsyncSessionLocal() as session:
+        stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
+        res = await session.execute(stmt)
+        btn = res.scalars().first()
+
+    if not btn:
+        await _safe_reply(query, "❌ Button not found.")
+        return
+
+    extra = json.loads(btn.extra_sources) if btn.extra_sources else []
+    keyboard = await build_sources_manage_keyboard(btn_id)
+
+    await query.edit_message_text(
+        f"📂 *Sources for:* {escape_markdown(btn.title or '', version=1)}\n\n"
+        f"Primary: 1 file\n"
+        f"Extra: {len(extra)} file(s)\n\n"
+        "Tap a source to replace/delete it, or add a new one:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+async def admin_edit_credit_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Opens the credits editor (edit_credit:<btn_id>)."""
+    query = update.callback_query
+    await query.answer()
+    btn_id = int(query.data.split(":")[1])
+
+    async with AsyncSessionLocal() as session:
+        stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
+        res = await session.execute(stmt)
+        btn = res.scalars().first()
+
+    if not btn:
+        await _safe_reply(query, "❌ Button not found.")
+        return
+
+    current = btn.credit_text if btn.credit_text else "None"
+    context.user_data["admin_state"] = "waiting_edit_credit"
+    context.user_data["edit_btn_id"] = btn_id
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭ Skip / Keep Current", callback_data=f"edit_credit_skip:{btn_id}")]
+    ])
+    await _safe_reply(
+        query,
+        f"📝 Current credits: `{escape_markdown(current, version=1)}`\n\nSend the new credits text (e.g. '@username' or channel link), or click below to keep the current value:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+async def admin_source_replace(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Replaces the primary source (src_replace:<btn_id>)."""
+    query = update.callback_query
+    await query.answer()
+    btn_id = int(query.data.split(":")[1])
+
+    context.user_data["admin_state"] = "waiting_replace_primary"
+    context.user_data["edit_btn_id"] = btn_id
+    await _safe_reply(
+        query,
+        "📂 Forward or send the new primary file to replace Source 1:"
+    )
+
+async def admin_source_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deletes an extra source (src_del:<btn_id>:<index>)."""
+    query = update.callback_query
+    await query.answer("Deleting source...")
+    parts = query.data.split(":")
+    btn_id = int(parts[1])
+    idx = int(parts[2])
+
+    async with AsyncSessionLocal() as session:
+        stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
+        res = await session.execute(stmt)
+        btn = res.scalars().first()
+
+        if btn and btn.extra_sources:
+            extra = json.loads(btn.extra_sources)
+            if 0 <= idx < len(extra):
+                extra.pop(idx)
+                btn.extra_sources = json.dumps(extra) if extra else None
+                await session.commit()
+
+    await admin_source_manage(update, context)
+
+async def admin_source_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts adding an extra source (src_add:<btn_id>)."""
+    query = update.callback_query
+    await query.answer()
+    btn_id = int(query.data.split(":")[1])
+
+    context.user_data["admin_state"] = "waiting_add_source"
+    context.user_data["edit_btn_id"] = btn_id
+    await _safe_reply(
+        query,
+        "📂 Forward or send a file to add as an extra source:"
+    )
 
 async def admin_publish_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -932,3 +1516,78 @@ async def handle_broadcast_edit_input(update: Update, context: ContextTypes.DEFA
         f"❌ Failed: `{failed}`",
         parse_mode="Markdown"
     )
+
+USERS_PER_PAGE = 15
+
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles /users — lists all registered users with pagination."""
+    user_id = update.effective_user.id
+    if not await check_admin(user_id):
+        await update.message.reply_text("❌ Permission Denied. Admins only.")
+        return
+
+    async with AsyncSessionLocal() as session:
+        stmt = select(User).order_by(User.joined_at.desc())
+        res = await session.execute(stmt)
+        users = res.scalars().all()
+
+    if not users:
+        await update.message.reply_text("📭 No users registered yet.")
+        return
+
+    context.user_data["users_list"] = users
+    await _render_users_page(update.message, context, page=0)
+
+async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles pagination for /users."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except (BadRequest, TelegramError) as e:
+        logger.warning(f"users_page_callback answer() failed: {e}")
+
+    page_str = query.data.split(":")[1]
+    if page_str == "noop":
+        return
+    page = int(page_str)
+    await _render_users_page(query, context, page=page)
+
+async def _render_users_page(message_or_query, context, page: int):
+    """Renders a single page of the users list."""
+    users = context.user_data.get("users_list", [])
+    total = len(users)
+    total_pages = max(1, (total + USERS_PER_PAGE - 1) // USERS_PER_PAGE)
+    start = page * USERS_PER_PAGE
+    end = start + USERS_PER_PAGE
+    page_users = users[start:end]
+
+    lines = [f"📊 *Total Users:* `{total}`\n"]
+    for i, u in enumerate(page_users, start=start + 1):
+        uname = escape_markdown(f"@{u.username}", version=1) if u.username else "—"
+        fname = escape_markdown(u.first_name, version=1) if u.first_name else "—"
+        admin_badge = " 👑" if u.is_admin else ""
+        joined = u.joined_at.strftime("%Y-%m-%d") if u.joined_at else "?"
+        lines.append(f"`{i}.` `{u.user_id}` | {uname} | {fname}{admin_badge} | `{joined}`")
+
+    text = "\n".join(lines)
+
+    buttons = []
+    if total_pages > 1:
+        row = []
+        if page > 0:
+            row.append(InlineKeyboardButton("◀️ Prev", callback_data=f"users_page:{page - 1}"))
+        row.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="users_page:noop"))
+        if page < total_pages - 1:
+            row.append(InlineKeyboardButton("Next ▶️", callback_data=f"users_page:{page + 1}"))
+        buttons.append(row)
+
+    buttons.append([InlineKeyboardButton("🔁 Refresh", callback_data="users_page:0")])
+    keyboard = InlineKeyboardMarkup(buttons) if buttons else None
+
+    if hasattr(message_or_query, "edit_message_text"):
+        try:
+            await message_or_query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
+        except (BadRequest, TelegramError) as e:
+            logger.warning(f"users_page edit_message_text failed: {e}")
+    else:
+        await message_or_query.reply_text(text=text, reply_markup=keyboard, parse_mode="Markdown")

@@ -1,5 +1,8 @@
+import json
 import logging
 from telegram import Update
+from telegram.error import BadRequest, TelegramError
+from telegram.helpers import escape_markdown
 from telegram.ext import ContextTypes
 from sqlalchemy import select
 from db import AsyncSessionLocal, User, DraftMenuButton, ProductionMenuButton
@@ -39,7 +42,10 @@ async def user_menu_navigation(update: Update, context: ContextTypes.DEFAULT_TYP
     Handles user navigation buttons (m:<id> and b:<parent_id>).
     """
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except (BadRequest, TelegramError) as e:
+        logger.warning(f"user_menu_navigation answer() failed: {e}")
     
     data = query.data
     
@@ -69,7 +75,10 @@ async def user_menu_navigation(update: Update, context: ContextTypes.DEFAULT_TYP
         f"*{menu_title.upper()}*\n\n"
         "Navigate subcategories or download resources below:"
     )
-    await query.edit_message_text(text=text, reply_markup=keyboard)
+    try:
+        await query.edit_message_text(text=text, reply_markup=keyboard)
+    except (BadRequest, TelegramError) as e:
+        logger.warning(f"user_menu_navigation edit_message_text() failed: {e}")
 
 async def user_link_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -78,50 +87,63 @@ async def user_link_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     - dl:<id> = draft link (admin testing from staging)
     """
     query = update.callback_query
-    await query.answer()
-    
+    try:
+        await query.answer("⏳ Fetching material...")  # Toast — no menu flicker
+    except (BadRequest, TelegramError) as e:
+        logger.warning(f"user_link_click initial answer() failed: {e}")
+
     is_draft = query.data.startswith("dl:")
     btn_id = int(query.data.split(":")[1])
     user_id = update.effective_user.id
-    
-    # Show loading state on the menu message
-    try:
-        await query.edit_message_text("⏳ Fetching material, please wait...")
-    except Exception:
-        pass
-    
+
     Table = DraftMenuButton if is_draft else ProductionMenuButton
     async with AsyncSessionLocal() as session:
         stmt = select(Table).where(Table.id == btn_id)
         res = await session.execute(stmt)
         btn = res.scalars().first()
-        
+
     if not btn or not btn.source_chat_id or not btn.source_message_id:
-        await query.edit_message_text("❌ Error: Material source not found for this button.")
+        await query.message.reply_text("❌ Error: Material source not found for this button.")
         return
-        
+
+    # Parse extra sources
+    extra = json.loads(btn.extra_sources) if btn.extra_sources else []
+    total_files = 1 + len(extra)
+
     try:
+        # Send primary source
         await context.bot.copy_message(
             chat_id=user_id,
             from_chat_id=btn.source_chat_id,
             message_id=btn.source_message_id
         )
-        
+
+        # Send extra sources
+        for src in extra:
+            try:
+                await context.bot.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=src["chat_id"],
+                    message_id=src["message_id"]
+                )
+            except Exception as e:
+                logger.error(f"Failed to deliver extra source for button {btn_id}: {e}")
+
         if btn.credit_text:
-            credits_text = f"ℹ️ *Source/Credits:* {btn.credit_text}"
+            credits_text = f"ℹ️ *Source/Credits:* {escape_markdown(btn.credit_text, version=1)}"
             await context.bot.send_message(
                 chat_id=user_id,
                 text=credits_text,
                 parse_mode="Markdown",
                 disable_web_page_preview=True
             )
-        
-        await query.edit_message_text(
-            f"✅ *{btn.title}* sent successfully!\n\nTap a button below to continue:",
-            reply_markup=await build_menu_keyboard(btn.parent_id, is_draft=is_draft)
-        )
+
+        try:
+            await query.answer(f"✅ {total_files} file(s) sent!")
+        except (BadRequest, TelegramError) as e:
+            logger.warning(f"user_link_click final answer() failed: {e}")
     except Exception as e:
-        await query.edit_message_text(
+        await query.message.reply_text(
             f"❌ Could not deliver this file.\n{str(e)[:100]}",
             reply_markup=await build_menu_keyboard(btn.parent_id, is_draft=is_draft) if btn else None
         )
