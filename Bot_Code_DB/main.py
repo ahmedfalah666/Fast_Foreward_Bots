@@ -227,8 +227,9 @@ async def post_init(application: Application):
     logger.info("Bot commands set successfully.")
 
 async def post_shutdown(application: Application):
-    """Cleanup on shutdown."""
-    logger.info("Application shutting down.")
+    """Cleanup on shutdown — release lock so another instance can take over."""
+    logger.info("Application shutting down — releasing lock")
+    sync_release_lock()
 
 
 def _preflight_probe() -> bool:
@@ -353,9 +354,8 @@ def main():
             application.run_polling(allowed_updates=Update.ALL_TYPES)
         except Exception as e:
             logger.error(f"Application stopped with error: {e}")
-
-        # ── Step 4: Release lock and loop ──
-        sync_release_lock()
+        finally:
+            sync_release_lock()
 
         if _conflict_detected:
             logger.info("Standby — conflict was detected during polling, retrying in 10s...")
