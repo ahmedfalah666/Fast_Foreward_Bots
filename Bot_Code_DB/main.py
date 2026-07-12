@@ -233,8 +233,8 @@ def _preflight_probe() -> bool:
     try:
         r = httpx.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
-            json={"limit": 1, "timeout": 5},
-            timeout=10,
+            json={"limit": 1, "timeout": 0},
+            timeout=5,
         )
         if r.status_code == 409:
             logger.warning("Preflight probe got 409 — another instance is still polling")
