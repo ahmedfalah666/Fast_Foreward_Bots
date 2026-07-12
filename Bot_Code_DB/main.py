@@ -82,11 +82,18 @@ logger = logging.getLogger(__name__)
 HEARTBEAT_INTERVAL = 10
 INSTANCE_NAME = LOCK_INSTANCE_NAME
 _conflict_detected = False
-_application_ref = None
 
 async def _heartbeat_loop():
-    """Background task: update last_heartbeat via async PG every HEARTBEAT_INTERVAL seconds."""
+    """Background task: update last_heartbeat via async PG every HEARTBEAT_INTERVAL seconds.
+
+    Stops the event loop if:
+    - 409 conflict is detected externally
+    - Lock is stolen by another instance (instance_name changed)
+    - Lock row is deleted
+    - PG is unreachable for 3 consecutive heartbeat cycles
+    """
     global _conflict_detected
+    consecutive_failures = 0
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL)
         if _conflict_detected:
@@ -97,11 +104,27 @@ async def _heartbeat_loop():
             async with AsyncSessionPG() as session:
                 result = await session.execute(select(BotLock).where(BotLock.id == 1))
                 lock = result.scalars().first()
-                if lock and lock.instance_name == INSTANCE_NAME:
-                    lock.last_heartbeat = datetime.utcnow()
-                    await session.commit()
+                if lock is None:
+                    logger.critical("Lock row deleted — stopping polling")
+                    _conflict_detected = True
+                    asyncio.get_event_loop().stop()
+                    return
+                if lock.instance_name != INSTANCE_NAME:
+                    logger.warning(f"Lock stolen by {lock.instance_name} — stopping polling")
+                    _conflict_detected = True
+                    asyncio.get_event_loop().stop()
+                    return
+                lock.last_heartbeat = datetime.utcnow()
+                await session.commit()
+                consecutive_failures = 0
         except Exception as e:
-            logger.error(f"Heartbeat error: {e}")
+            consecutive_failures += 1
+            logger.error(f"Heartbeat error ({consecutive_failures}/3): {e}")
+            if consecutive_failures >= 3:
+                logger.critical("Heartbeat failed 3 times — PG is unreachable, stopping polling")
+                _conflict_detected = True
+                asyncio.get_event_loop().stop()
+                return
 
 async def route_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -167,8 +190,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def post_init(application: Application):
     """Sync from PG, start heartbeat, set bot commands."""
-    global _application_ref, _conflict_detected
-    _application_ref = application
+    global _conflict_detected
     _conflict_detected = False
 
     await init_db()
