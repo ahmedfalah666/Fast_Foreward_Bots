@@ -94,8 +94,11 @@ pkill -x sshd 2>/dev/null || true
 sshd
 info "sshd running on port $SSHD_PORT"
 
-# Show login hint
-IP=$(ip -4 addr show wlan0 2>/dev/null | grep -oP 'inet \K[\d.]+' || echo "<get IP with: ip addr>")
+# Show login hint — try multiple methods for Termux/Android
+IP=$(hostname -I 2>/dev/null | awk '{print $1}' || \
+     getprop dhcp.wlan0.ipaddress 2>/dev/null || \
+     ifconfig 2>/dev/null | grep 'inet ' | awk '{print $2}' | head -1 || \
+     echo "")
 echo -e "  ${BOLD}ssh u0_a223@$IP -p $SSHD_PORT${NC}"
 
 # ─── Step 6: Wake lock (CPU stays awake with screen off) ─────
@@ -135,4 +138,5 @@ fi
 header "Ready"
 echo -e "  Bot PID:  $(pgrep -f 'python.*main\.py' | head -1)"
 echo -e "  Screen:   ${SCREEN_NAME}"
-echo -e "  SSH:      ${BOLD}ssh u0_a223@$IP -p $SSHD_PORT${NC}"
+IP_FINAL=$(hostname -I 2>/dev/null | awk '{print $1}' || getprop dhcp.wlan0.ipaddress 2>/dev/null || echo "<check manually>")
+echo -e "  SSH:      ${BOLD}ssh u0_a223@$IP_FINAL -p $SSHD_PORT${NC}"
