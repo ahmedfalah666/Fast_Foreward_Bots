@@ -90,11 +90,8 @@ async def _heartbeat_loop():
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL)
         if _conflict_detected:
-            logger.warning("409 Conflict detected — releasing lock and stopping")
-            sync_release_lock()
-            app = _application_ref
-            if app:
-                await app.stop()
+            logger.warning("409 Conflict detected — stopping event loop for clean failover")
+            asyncio.get_event_loop().stop()
             return
         try:
             async with AsyncSessionPG() as session:
@@ -214,8 +211,8 @@ def _preflight_probe() -> bool:
     try:
         r = httpx.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
-            json={"limit": 1, "timeout": 1, "offset": -1},
-            timeout=5,
+            json={"limit": 1, "timeout": 5},
+            timeout=10,
         )
         if r.status_code == 409:
             logger.warning("Preflight probe got 409 — another instance is still polling")
