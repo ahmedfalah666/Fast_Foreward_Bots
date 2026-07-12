@@ -6,7 +6,7 @@ from telegram.error import BadRequest, TelegramError
 from telegram.helpers import escape_markdown
 from telegram.ext import ContextTypes
 from sqlalchemy import select, delete
-from db import AsyncSessionLocal, User, DraftMenuButton, ProductionMenuButton, Broadcast, BroadcastRecipient, sync_draft_to_production, push_table_to_postgres
+from db import AsyncSessionLocal, AsyncSessionPG, User, DraftMenuButton, ProductionMenuButton, Broadcast, BroadcastRecipient, sync_draft_to_production, pg_update, pg_delete, pg_create, pg_exec
 from keyboards import build_menu_keyboard, build_button_edit_keyboard, build_color_picker_keyboard, build_parent_selector_keyboard, build_copy_source_keyboard, build_sources_manage_keyboard
 from config import ADMIN_IDS, STORAGE_CHANNEL_ID
 
@@ -260,15 +260,7 @@ async def admin_set_color_execute(update: Update, context: ContextTypes.DEFAULT_
     
     button_style = None if style == "none" else style
     
-    async with AsyncSessionLocal() as session:
-        stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
-        res = await session.execute(stmt)
-        btn = res.scalars().first()
-        if btn:
-            btn.button_style = button_style
-            await session.commit()
-            await push_table_to_postgres(DraftMenuButton)
-            
+    await pg_update(DraftMenuButton, btn_id, button_style=button_style)
     await show_admin_edit_panel(query, btn_id)
 
 async def admin_reorder_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -289,32 +281,36 @@ async def admin_reorder_execute(update: Update, context: ContextTypes.DEFAULT_TY
         stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
         res = await session.execute(stmt)
         btn = res.scalars().first()
-        
+
         if not btn:
             await _safe_reply(query, "❌ Button not found.")
             return
-            
+
         parent_id = btn.parent_id
         stmt_siblings = select(DraftMenuButton).where(DraftMenuButton.parent_id == parent_id).order_by(DraftMenuButton.order_index)
         res_siblings = await session.execute(stmt_siblings)
         siblings = res_siblings.scalars().all()
-        
+
         for idx, s in enumerate(siblings):
             s.order_index = idx
-            
+
         active_idx = next(i for i, s in enumerate(siblings) if s.id == btn_id)
-        
+
         if direction == "up" and active_idx > 0:
-            siblings[active_idx].order_index = active_idx - 1
-            siblings[active_idx - 1].order_index = active_idx
-            await session.commit()
-            await push_table_to_postgres(DraftMenuButton)
+            async def _reorder_up(s):
+                b = (await s.execute(select(DraftMenuButton).where(DraftMenuButton.id == btn_id))).scalars().first()
+                prev = (await s.execute(select(DraftMenuButton).where(DraftMenuButton.id == siblings[active_idx - 1].id))).scalars().first()
+                b.order_index = active_idx - 1
+                prev.order_index = active_idx
+            await pg_exec(_reorder_up)
             reordered = True
         elif direction == "down" and active_idx < len(siblings) - 1:
-            siblings[active_idx].order_index = active_idx + 1
-            siblings[active_idx + 1].order_index = active_idx
-            await session.commit()
-            await push_table_to_postgres(DraftMenuButton)
+            async def _reorder_down(s):
+                b = (await s.execute(select(DraftMenuButton).where(DraftMenuButton.id == btn_id))).scalars().first()
+                nxt = (await s.execute(select(DraftMenuButton).where(DraftMenuButton.id == siblings[active_idx + 1].id))).scalars().first()
+                b.order_index = active_idx + 1
+                nxt.order_index = active_idx
+            await pg_exec(_reorder_down)
             reordered = True
 
     if reordered:
@@ -525,55 +521,42 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
             
         btn_id = context.user_data["edit_btn_id"]
-        async with AsyncSessionLocal() as session:
-            stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
-            res = await session.execute(stmt)
-            btn = res.scalars().first()
-            if btn:
-                btn.title = new_title
-                await session.commit()
-                await push_table_to_postgres(DraftMenuButton)
-                await update.message.reply_text(f"✅ Button renamed to '{new_title}' successfully!")
-                
+        await pg_update(DraftMenuButton, btn_id, title=new_title)
+        await update.message.reply_text(f"✅ Button renamed to '{new_title}' successfully!")
         context.user_data.clear()
         await show_admin_edit_panel(update.message, btn_id)
         
     elif admin_state == "waiting_edit_link":
         btn_id = context.user_data["edit_btn_id"]
-        
+
         async with AsyncSessionLocal() as session:
             stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
             res = await session.execute(stmt)
             btn = res.scalars().first()
-            
-            if not btn:
-                await update.message.reply_text("❌ Button not found in database.")
-                context.user_data.clear()
-                return
-                
-            if btn.button_type == "link":
-                chat_id, msg_id = await _resolve_source_for_link(update, context)
-                if not chat_id or not msg_id:
-                    return  # error already sent by helper
 
-                btn.source_chat_id = chat_id
-                btn.source_message_id = msg_id
-                await session.commit()
-                await push_table_to_postgres(DraftMenuButton)
-                await update.message.reply_text("✅ Link button file source updated successfully!")
-                
-            elif btn.button_type in ("fb", "feedback"):
-                link = update.message.text
-                if not link:
-                    await update.message.reply_text("❌ Link cannot be empty. Please send text.")
-                    return
-                    
-                normalized_link = _normalize_telegram_link(link)
-                btn.credit_text = normalized_link
-                await session.commit()
-                await push_table_to_postgres(DraftMenuButton)
-                await update.message.reply_text("✅ Feedback bot link updated successfully!")
-                
+        if not btn:
+            await update.message.reply_text("❌ Button not found in database.")
+            context.user_data.clear()
+            return
+
+        if btn.button_type == "link":
+            chat_id, msg_id = await _resolve_source_for_link(update, context)
+            if not chat_id or not msg_id:
+                return
+
+            await pg_update(DraftMenuButton, btn_id, source_chat_id=chat_id, source_message_id=msg_id)
+            await update.message.reply_text("✅ Link button file source updated successfully!")
+
+        elif btn.button_type in ("fb", "feedback"):
+            link = update.message.text
+            if not link:
+                await update.message.reply_text("❌ Link cannot be empty. Please send text.")
+                return
+
+            normalized_link = _normalize_telegram_link(link)
+            await pg_update(DraftMenuButton, btn_id, credit_text=normalized_link)
+            await update.message.reply_text("✅ Feedback bot link updated successfully!")
+
         context.user_data.clear()
         await show_admin_edit_panel(update.message, btn_id)
         
@@ -681,15 +664,7 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if not chat_id or not msg_id:
             return
 
-        async with AsyncSessionLocal() as session:
-            stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
-            res = await session.execute(stmt)
-            btn = res.scalars().first()
-            if btn:
-                btn.source_chat_id = chat_id
-                btn.source_message_id = msg_id
-                await session.commit()
-                await push_table_to_postgres(DraftMenuButton)
+        await pg_update(DraftMenuButton, btn_id, source_chat_id=chat_id, source_message_id=msg_id)
 
         context.user_data.clear()
         await update.message.reply_text("✅ Primary source replaced!")
@@ -722,9 +697,10 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if btn:
                 extra = json.loads(btn.extra_sources) if btn.extra_sources else []
                 extra.append({"chat_id": chat_id, "message_id": msg_id})
-                btn.extra_sources = json.dumps(extra)
-                await session.commit()
-                await push_table_to_postgres(DraftMenuButton)
+                new_extra_json = json.dumps(extra)
+
+        if btn:
+            await pg_update(DraftMenuButton, btn_id, extra_sources=new_extra_json)
 
         context.user_data.clear()
         await update.message.reply_text("✅ Extra source added!")
@@ -748,15 +724,7 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         btn_id = context.user_data["edit_btn_id"]
         text = update.message.text
 
-        async with AsyncSessionLocal() as session:
-            stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
-            res = await session.execute(stmt)
-            btn = res.scalars().first()
-            if btn:
-                btn.credit_text = text
-                await session.commit()
-                await push_table_to_postgres(DraftMenuButton)
-
+        await pg_update(DraftMenuButton, btn_id, credit_text=text)
         context.user_data.clear()
         await update.message.reply_text("✅ Credits updated!")
         await show_admin_edit_panel(update.message, btn_id)
@@ -816,30 +784,31 @@ async def save_button_to_db(context: ContextTypes.DEFAULT_TYPE):
     parent_id = context.user_data["add_parent_id"]
     btn_type = context.user_data["add_button_type"]
     title = context.user_data["new_btn_title"]
-    
+    button_style = context.user_data.get("new_btn_style")
+    source_chat_id = context.user_data.get("new_btn_chat_id")
+    source_message_id = context.user_data.get("new_btn_message_id")
+    credit_text = context.user_data.get("new_btn_credit_text")
+    extra_list = context.user_data.get("extra_sources", [])
+    extra_json = json.dumps(extra_list) if extra_list else None
+
     async with AsyncSessionLocal() as session:
         stmt = select(DraftMenuButton).where(DraftMenuButton.parent_id == parent_id)
         res = await session.execute(stmt)
         sibling_buttons = res.scalars().all()
         next_order = len(sibling_buttons)
-        
-        extra_list = context.user_data.get("extra_sources", [])
-        extra_json = json.dumps(extra_list) if extra_list else None
 
-        new_btn = DraftMenuButton(
-            parent_id=parent_id,
-            title=title,
-            button_type=btn_type,
-            order_index=next_order,
-            button_style=context.user_data.get("new_btn_style"),
-            source_chat_id=context.user_data.get("new_btn_chat_id"),
-            source_message_id=context.user_data.get("new_btn_message_id"),
-            credit_text=context.user_data.get("new_btn_credit_text"),
-            extra_sources=extra_json
-        )
-        session.add(new_btn)
-        await session.commit()
-        await push_table_to_postgres(DraftMenuButton)
+    await pg_create(
+        DraftMenuButton,
+        parent_id=parent_id,
+        title=title,
+        button_type=btn_type,
+        order_index=next_order,
+        button_style=button_style,
+        source_chat_id=source_chat_id,
+        source_message_id=source_message_id,
+        credit_text=credit_text,
+        extra_sources=extra_json
+    )
 
 async def admin_delete_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -854,25 +823,25 @@ async def admin_delete_click(update: Update, context: ContextTypes.DEFAULT_TYPE)
         stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
         res = await session.execute(stmt)
         btn = res.scalars().first()
-        
-        if btn:
-            parent_id = btn.parent_id
-            await session.delete(btn)
-            await session.commit()
-            await push_table_to_postgres(DraftMenuButton)
-            
-            # Reorder remaining siblings
-            stmt_siblings = select(DraftMenuButton).where(DraftMenuButton.parent_id == parent_id).order_by(DraftMenuButton.order_index)
-            res_siblings = await session.execute(stmt_siblings)
-            siblings = res_siblings.scalars().all()
-            for idx, s in enumerate(siblings):
-                s.order_index = idx
-            await session.commit()
-            await push_table_to_postgres(DraftMenuButton)
-            
-            await show_admin_manage_mode(query, parent_id)
-        else:
-            await _safe_reply(query, "❌ Button not found in database.")
+
+    if not btn:
+        await _safe_reply(query, "❌ Button not found in database.")
+        return
+
+    parent_id = btn.parent_id
+
+    async def _delete_and_reindex(session):
+        b = (await session.execute(select(DraftMenuButton).where(DraftMenuButton.id == btn_id))).scalars().first()
+        if b:
+            await session.delete(b)
+        siblings = (await session.execute(
+            select(DraftMenuButton).where(DraftMenuButton.parent_id == parent_id).order_by(DraftMenuButton.order_index)
+        )).scalars().all()
+        for idx, s in enumerate(siblings):
+            s.order_index = idx
+
+    await pg_exec(_delete_and_reindex)
+    await show_admin_manage_mode(query, parent_id)
 
 async def _get_descendant_ids(session, parent_id: int) -> set[int]:
     """Recursively collect all descendant button IDs under a menu button."""
@@ -972,41 +941,37 @@ async def admin_move_to_select(update: Update, context: ContextTypes.DEFAULT_TYP
 
     new_parent = None if parent_raw == "root" else int(parent_raw)
 
-    async with AsyncSessionLocal() as session:
-        stmt = select(DraftMenuButton).where(DraftMenuButton.id == btn_id)
-        res = await session.execute(stmt)
-        btn = res.scalars().first()
-
-        if not btn:
-            await _safe_reply(query, "❌ Button not found.")
-            return
-
-        old_parent = btn.parent_id
-
-        # Safety: no-op if same parent
-        if btn.parent_id == new_parent:
-            await query.edit_message_text(
-                f"⚠️ That button is already in that folder. No change made.",
-                parse_mode="Markdown"
-            )
-            return
-
-        # Move the button: update parent_id and append at end of new sibling list
-        stmt_count = select(DraftMenuButton).where(DraftMenuButton.parent_id == new_parent)
-        res_count = await session.execute(stmt_count)
-        new_siblings = res_count.scalars().all()
-        btn.parent_id = new_parent
-        btn.order_index = len(new_siblings)
-
-        # Re-index old siblings to close the gap
-        stmt_old = select(DraftMenuButton).where(DraftMenuButton.parent_id == old_parent).order_by(DraftMenuButton.order_index)
-        res_old = await session.execute(stmt_old)
-        old_siblings = res_old.scalars().all()
+    async def _move_and_reindex(session):
+        b = (await session.execute(select(DraftMenuButton).where(DraftMenuButton.id == btn_id))).scalars().first()
+        if not b:
+            return False
+        old_parent = b.parent_id
+        if old_parent == new_parent:
+            return False
+        new_siblings = (await session.execute(
+            select(DraftMenuButton).where(DraftMenuButton.parent_id == new_parent)
+        )).scalars().all()
+        b.parent_id = new_parent
+        b.order_index = len(new_siblings)
+        old_siblings = (await session.execute(
+            select(DraftMenuButton).where(DraftMenuButton.parent_id == old_parent).order_by(DraftMenuButton.order_index)
+        )).scalars().all()
         for idx, s in enumerate(old_siblings):
             s.order_index = idx
+        return True
 
-        await session.commit()
-        await push_table_to_postgres(DraftMenuButton)
+    moved = await pg_exec(_move_and_reindex)
+
+    if not moved:
+        await query.edit_message_text(
+            f"⚠️ That button is already in that folder. No change made.",
+            parse_mode="Markdown"
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        b = (await session.execute(select(DraftMenuButton).where(DraftMenuButton.id == btn_id))).scalars().first()
+        safe_title = escape_markdown(b.title or "", version=1) if b else "?"
 
     parent_name = "Main Menu (Root)"
     if new_parent is not None:
@@ -1017,7 +982,6 @@ async def admin_move_to_select(update: Update, context: ContextTypes.DEFAULT_TYP
             if p:
                 parent_name = p.title
 
-    safe_title = escape_markdown(btn.title or "", version=1)
     await query.edit_message_text(
         f"✅ *{safe_title}* moved to *{parent_name}* successfully!",
         parse_mode="Markdown"
@@ -1089,7 +1053,6 @@ async def admin_copy_execute(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     async with AsyncSessionLocal() as session:
-        # Fetch source buttons
         stmt = select(DraftMenuButton).where(
             DraftMenuButton.parent_id == source_parent
         ).order_by(DraftMenuButton.order_index)
@@ -1100,7 +1063,7 @@ async def admin_copy_execute(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await query.edit_message_text("⚠️ Source menu has no buttons to copy.")
             return
 
-        # Fetch existing target buttons to compute starting order_index
+    async def _copy_buttons(session):
         stmt_t = select(DraftMenuButton).where(
             DraftMenuButton.parent_id == target_parent
         ).order_by(DraftMenuButton.order_index)
@@ -1108,7 +1071,6 @@ async def admin_copy_execute(update: Update, context: ContextTypes.DEFAULT_TYPE)
         target_buttons = res_t.scalars().all()
         next_order = len(target_buttons)
 
-        # Copy each source button as a new button under target
         for src in source_buttons:
             new_btn = DraftMenuButton(
                 parent_id=target_parent,
@@ -1123,8 +1085,7 @@ async def admin_copy_execute(update: Update, context: ContextTypes.DEFAULT_TYPE)
             session.add(new_btn)
             next_order += 1
 
-        await session.commit()
-        await push_table_to_postgres(DraftMenuButton)
+    await pg_exec(_copy_buttons)
 
     source_name = "Main Menu (Root)"
     if source_parent is not None:
@@ -1248,13 +1209,12 @@ async def admin_source_delete(update: Update, context: ContextTypes.DEFAULT_TYPE
         res = await session.execute(stmt)
         btn = res.scalars().first()
 
-        if btn and btn.extra_sources:
-            extra = json.loads(btn.extra_sources)
-            if 0 <= idx < len(extra):
-                extra.pop(idx)
-                btn.extra_sources = json.dumps(extra) if extra else None
-                await session.commit()
-                await push_table_to_postgres(DraftMenuButton)
+    if btn and btn.extra_sources:
+        extra = json.loads(btn.extra_sources)
+        if 0 <= idx < len(extra):
+            extra.pop(idx)
+            new_extra_json = json.dumps(extra) if extra else None
+            await pg_update(DraftMenuButton, btn_id, extra_sources=new_extra_json)
 
     await admin_source_manage(update, context)
 
@@ -1292,9 +1252,24 @@ async def admin_publish_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
     elif query.data == "publish_execute":
         try:
+            # Sync Draft→Production on SQLite first
             await sync_draft_to_production()
-            await push_table_to_postgres(DraftMenuButton)
-            await push_table_to_postgres(ProductionMenuButton)
+            # Push both tables to PG (full sync)
+            async with AsyncSessionLocal() as local:
+                draft_rows = (await local.execute(select(DraftMenuButton))).scalars().all()
+                prod_rows = (await local.execute(select(ProductionMenuButton))).scalars().all()
+
+            async with AsyncSessionPG() as pg:
+                await pg.execute(delete(DraftMenuButton))
+                await pg.execute(delete(ProductionMenuButton))
+                for row in sorted(draft_rows, key=lambda r: getattr(r, 'id', 0)):
+                    state = {k: v for k, v in row.__dict__.items() if not k.startswith('_')}
+                    pg.add(DraftMenuButton(**state))
+                for row in sorted(prod_rows, key=lambda r: getattr(r, 'id', 0)):
+                    state = {k: v for k, v in row.__dict__.items() if not k.startswith('_')}
+                    pg.add(ProductionMenuButton(**state))
+                await pg.commit()
+
             await query.edit_message_text("🚀 *LIVE MENU UPDATED SUCCESSFULY!* 🚀\n\nAll users can now see your changes.")
         except Exception as e:
             await query.edit_message_text(f"❌ Synchronization failed: {str(e)}")
@@ -1341,8 +1316,8 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             fail_count += 1
 
-    # Store in DB
-    async with AsyncSessionLocal() as session:
+    # Store in PG first, then mirror to SQLite
+    async with AsyncSessionPG() as session:
         broadcast = Broadcast(
             text=broadcast_text,
             parse_mode="Markdown",
@@ -1360,8 +1335,27 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 message_id=r["message_id"]
             ))
         await session.commit()
-        await push_table_to_postgres(Broadcast)
-        await push_table_to_postgres(BroadcastRecipient)
+        broadcast_id = broadcast.id
+
+    async with AsyncSessionLocal() as session:
+        broadcast = Broadcast(
+            id=broadcast_id,
+            text=broadcast_text,
+            parse_mode="Markdown",
+            sent_count=success_count,
+            fail_count=fail_count
+        )
+        session.add(broadcast)
+        await session.flush()
+
+        for r in recipients_data:
+            session.add(BroadcastRecipient(
+                broadcast_id=broadcast_id,
+                user_id=r["user_id"],
+                chat_id=r["chat_id"],
+                message_id=r["message_id"]
+            ))
+        await session.commit()
 
     await status_msg.edit_text(
         f"✅ *Broadcast Complete!*\n\n"
@@ -1475,16 +1469,29 @@ async def _delete_broadcast(broadcast_id: int, query, context):
         except Exception:
             failed += 1
 
-    async with AsyncSessionLocal() as session:
-        stmt = select(BroadcastRecipient).where(BroadcastRecipient.broadcast_id == broadcast_id)
-        res = await session.execute(stmt)
-        for r in res.scalars().all():
-            await session.delete(r)
-        if broadcast:
-            await session.delete(broadcast)
+    recipient_ids = [r.id for r in recipients]
+
+    # Delete from PG first
+    async with AsyncSessionPG() as session:
+        for rid in recipient_ids:
+            r = await session.get(BroadcastRecipient, rid)
+            if r:
+                await session.delete(r)
+        b = await session.get(Broadcast, broadcast_id)
+        if b:
+            await session.delete(b)
         await session.commit()
-        await push_table_to_postgres(Broadcast)
-        await push_table_to_postgres(BroadcastRecipient)
+
+    # Delete from SQLite
+    async with AsyncSessionLocal() as session:
+        for rid in recipient_ids:
+            r = await session.get(BroadcastRecipient, rid)
+            if r:
+                await session.delete(r)
+        b = await session.get(Broadcast, broadcast_id)
+        if b:
+            await session.delete(b)
+        await session.commit()
 
     await query.edit_message_text(
         f"✅ *Broadcast #{broadcast_id} deleted!*\n\n"
@@ -1545,10 +1552,7 @@ async def handle_broadcast_edit_input(update: Update, context: ContextTypes.DEFA
                 failed += 1
 
     if broadcast:
-        async with AsyncSessionLocal() as session:
-            broadcast.text = new_text
-            await session.commit()
-            await push_table_to_postgres(Broadcast)
+        await pg_update(Broadcast, broadcast_id, text=new_text)
 
     await update.message.reply_text(
         f"✅ *Broadcast #{broadcast_id} updated!*\n\n"

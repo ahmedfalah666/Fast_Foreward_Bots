@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import json
+import logging
 import os
 import socket
 import time
@@ -10,6 +11,8 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy import Column, Integer, BigInteger, String, Boolean, ForeignKey, DateTime, Text, select, delete, event
 from config import DATABASE_URL, ADMIN_IDS
+
+logger = logging.getLogger(__name__)
 
 # ─── Failover constants ────────────────────────────────────────────────
 LOCK_STALE_SECONDS = 30
@@ -189,26 +192,99 @@ async def pull_from_postgres():
             print(f"  Synced {table_class.__tablename__}: {len(rows)} rows")
 
 
-async def push_table_to_postgres(table_class):
-    """Push one table from SQLite → PostgreSQL (non-blocking, fire-and-forget)."""
-    if engine_pg is None:
-        return
-    asyncio.create_task(_push_table_impl(table_class))
+# ─── PG-first write helpers (PG must succeed, SQLite mirrors) ──────────
 
-async def _push_table_impl(table_class):
-    try:
-        async with AsyncSessionLocal() as local_session:
-            rows = (await local_session.execute(select(table_class))).scalars().all()
+async def pg_update(table_class, row_id, **fields):
+    """Update a row in PG first, then mirror to SQLite.
 
-        async with AsyncSessionPG() as pg_session:
-            await pg_session.execute(delete(table_class))
-            for row in sorted(rows, key=lambda r: getattr(r, 'id', 0)):
-                state = {k: v for k, v in row.__dict__.items() if not k.startswith('_')}
-                new_row = table_class(**state)
-                pg_session.add(new_row)
-            await pg_session.commit()
-    except Exception as e:
-        print(f"Push to PostgreSQL failed for {table_class.__tablename__}: {e}")
+    Raises on PG failure — the operation is rejected entirely.
+    Works with any PK column named `id` or `user_id`.
+    """
+    pk_col = getattr(table_class, 'user_id', None) or getattr(table_class, 'id')
+
+    if engine_pg is not None:
+        async with AsyncSessionPG() as session:
+            row = await session.get(table_class, row_id)
+            if row is None:
+                raise LookupError(f"{table_class.__tablename__} #{row_id} not found")
+            for k, v in fields.items():
+                setattr(row, k, v)
+            await session.commit()
+
+    async with AsyncSessionLocal() as session:
+        row = await session.get(table_class, row_id)
+        if row is not None:
+            for k, v in fields.items():
+                setattr(row, k, v)
+            await session.commit()
+
+
+async def pg_delete(table_class, row_id):
+    """Delete a row from PG first, then mirror to SQLite."""
+    async with AsyncSessionPG() as session:
+        row = await session.get(table_class, row_id)
+        if row is not None:
+            await session.delete(row)
+            await session.commit()
+
+    async with AsyncSessionLocal() as session:
+        row = await session.get(table_class, row_id)
+        if row is not None:
+            await session.delete(row)
+            await session.commit()
+
+
+async def pg_create(table_class, **fields):
+    """Create a row in PG first, return its PK, then mirror to SQLite with same PK.
+
+    Handles tables with `user_id` as PK (User) and `id` as PK (all others).
+    """
+    pk_col = 'user_id' if hasattr(table_class, 'user_id') else 'id'
+    pk_in_fields = pk_col in fields
+
+    if engine_pg is not None:
+        async with AsyncSessionPG() as session:
+            row = table_class(**fields)
+            session.add(row)
+            await session.commit()
+            new_pk = getattr(row, pk_col)
+    else:
+        async with AsyncSessionLocal() as session:
+            row = table_class(**fields)
+            session.add(row)
+            await session.commit()
+            return getattr(row, pk_col)
+
+    async with AsyncSessionLocal() as session:
+        if not pk_in_fields:
+            fields[pk_col] = new_pk
+        row = table_class(**fields)
+        session.add(row)
+        await session.commit()
+
+    return new_pk
+
+
+async def pg_exec(callback):
+    """Run an arbitrary write operation on PG first, then mirror on SQLite.
+
+    callback(session) — receives a single session argument.
+    Must NOT call commit() — the caller handles it.
+    Must operate on KNOWN IDs only (reads + writes by PK).
+    Returns the callback's return value.
+
+    Handles the case where engine_pg is None (SQLite-only mode).
+    """
+    if engine_pg is not None:
+        async with AsyncSessionPG() as session:
+            result = await callback(session)
+            await session.commit()
+
+    async with AsyncSessionLocal() as session:
+        await callback(session)
+        await session.commit()
+
+    return result
 
 
 # ─── Synchronous lock operations (called BEFORE any async code) ──────

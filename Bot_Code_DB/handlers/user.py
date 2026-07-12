@@ -5,7 +5,7 @@ from telegram.error import BadRequest, TelegramError
 from telegram.helpers import escape_markdown
 from telegram.ext import ContextTypes
 from sqlalchemy import select
-from db import AsyncSessionLocal, User, DraftMenuButton, ProductionMenuButton, push_table_to_postgres
+from db import AsyncSessionLocal, AsyncSessionPG, User, DraftMenuButton, ProductionMenuButton, pg_create
 from keyboards import build_menu_keyboard
 
 logger = logging.getLogger(__name__)
@@ -18,16 +18,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.effective_user.username
     first_name = update.effective_user.first_name
     
-    # 1. Register User in Database
+    # 1. Register User in Database (PG first, then SQLite)
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(User).filter_by(user_id=user_id))
         db_user = result.scalars().first()
-        
-        if not db_user:
-            db_user = User(user_id=user_id, username=username, first_name=first_name)
-            session.add(db_user)
-            await session.commit()
-            await push_table_to_postgres(User)
+
+    if not db_user:
+        await pg_create(User, user_id=user_id, username=username, first_name=first_name)
             
     # 2. Render Main Menu
     keyboard = await build_menu_keyboard(None, is_draft=False)

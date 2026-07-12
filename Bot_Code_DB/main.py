@@ -22,7 +22,7 @@ from config import BOT_TOKEN
 from db import (
     init_db, AsyncSessionPG, BotLock, pull_from_postgres,
     sync_ensure_lock_table, sync_acquire_lock, sync_release_lock,
-    LOCK_STALE_SECONDS, LOCK_INSTANCE_NAME,
+    LOCK_INSTANCE_NAME,
 )
 from handlers.user import (
     start_command,
