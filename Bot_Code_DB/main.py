@@ -144,13 +144,22 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     import html
     import json
     import datetime
-    from telegram.error import Conflict as _Conflict
+    from telegram.error import Conflict as _Conflict, TimedOut, NetworkError
     from config import ADMIN_IDS
 
     global _conflict_detected
     if isinstance(context.error, _Conflict):
         logger.warning("409 Conflict detected — another instance is active")
         _conflict_detected = True
+        return
+
+    # Network errors (TimedOut, DNS failures) are transient — log quietly, skip Telegram notification
+    if isinstance(context.error, (TimedOut, NetworkError)):
+        logger.warning(f"Network error in handler: {context.error}")
+        with open("errors.log", "a", encoding="utf-8") as f:
+            f.write(f"--- NETWORK ERROR AT {datetime.datetime.utcnow().isoformat()} ---\n")
+            f.write(f"Update: {update}\n")
+            f.write(f"{context.error}\n\n")
         return
 
     logger.error("Exception while handling an update:", exc_info=context.error)
@@ -173,7 +182,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     tb_escaped = html.escape(tb_string)
 
     error_msg = (
-        f"⚠️ <b>An Exception Occurred!</b>\n\n"
+        f"\u26a0\ufe0f <b>An Exception Occurred!</b>\n\n"
         f"<b>Update:</b>\n<pre><code class=\"language-json\">{update_str[:1000]}</code></pre>\n\n"
         f"<b>Traceback:</b>\n<pre><code class=\"language-python\">{tb_escaped[:2500]}</code></pre>"
     )

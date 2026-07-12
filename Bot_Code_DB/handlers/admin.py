@@ -1,10 +1,13 @@
 import re
 import json
+import logging
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageOriginChannel, MessageOriginChat
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, TelegramError, TimedOut, NetworkError
 from telegram.helpers import escape_markdown
 from telegram.ext import ContextTypes
+
+logger = logging.getLogger(__name__)
 from sqlalchemy import select, delete
 from db import AsyncSessionLocal, AsyncSessionPG, User, DraftMenuButton, ProductionMenuButton, Broadcast, BroadcastRecipient, sync_draft_to_production, pg_update, pg_delete, pg_create, pg_exec
 from keyboards import build_menu_keyboard, build_button_edit_keyboard, build_color_picker_keyboard, build_parent_selector_keyboard, build_copy_source_keyboard, build_sources_manage_keyboard
@@ -176,12 +179,17 @@ async def admin_edit_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _safe_reply(query, text, parse_mode=None, reply_markup=None):
     """Reply to callback query, falling back to DM if message was deleted."""
-    if query.message:
-        await query.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
-    else:
-        await query.get_bot().send_message(
-            chat_id=query.from_user.id, text=text, parse_mode=parse_mode, reply_markup=reply_markup
-        )
+    try:
+        if query.message:
+            await query.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+        else:
+            await query.get_bot().send_message(
+                chat_id=query.from_user.id, text=text, parse_mode=parse_mode, reply_markup=reply_markup
+            )
+    except TimedOut:
+        logger.warning(f"Timed out replying to {query.from_user.id}")
+    except NetworkError as e:
+        logger.warning(f"Network error replying to {query.from_user.id}: {e}")
 
 async def admin_rename_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
