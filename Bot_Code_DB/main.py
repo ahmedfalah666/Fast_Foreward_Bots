@@ -90,12 +90,14 @@ async def _heartbeat_loop():
     - 409 conflict is detected externally
     - Lock is stolen by another instance (instance_name changed)
     - Lock row is deleted
-    - PG is unreachable for 3 consecutive heartbeat cycles
+
+    PG connection failures are logged and retried — they are transient (sleep,
+    network hiccup) and should not kill the bot.
     """
     global _conflict_detected
-    consecutive_failures = 0
+    backoff = 1
     while True:
-        await asyncio.sleep(HEARTBEAT_INTERVAL)
+        await asyncio.sleep(HEARTBEAT_INTERVAL * backoff)
         if _conflict_detected:
             logger.warning("409 Conflict detected — stopping event loop for clean failover")
             asyncio.get_event_loop().stop()
@@ -116,15 +118,10 @@ async def _heartbeat_loop():
                     return
                 lock.last_heartbeat = datetime.utcnow()
                 await session.commit()
-                consecutive_failures = 0
+                backoff = 1
         except Exception as e:
-            consecutive_failures += 1
-            logger.error(f"Heartbeat error ({consecutive_failures}/3): {e}")
-            if consecutive_failures >= 3:
-                logger.critical("Heartbeat failed 3 times — PG is unreachable, stopping polling")
-                _conflict_detected = True
-                asyncio.get_event_loop().stop()
-                return
+            logger.warning(f"Heartbeat PG error (retry in {10*backoff}s): {e}")
+            backoff = min(backoff * 2, 6)
 
 async def route_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """

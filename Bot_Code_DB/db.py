@@ -328,24 +328,28 @@ def sync_acquire_lock() -> bool:
     now = datetime.datetime.utcnow()
     stale_before = now - timedelta(seconds=LOCK_STALE_SECONDS)
 
-    with psycopg.connect(dsn) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO bot_lock (id, instance_name, last_heartbeat) "
-                "VALUES (1, %s, %s) ON CONFLICT DO NOTHING",
-                (LOCK_INSTANCE_NAME, now)
-            )
-            if cur.rowcount > 0:
-                conn.commit()
-                return True
+    try:
+        with psycopg.connect(dsn, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO bot_lock (id, instance_name, last_heartbeat) "
+                    "VALUES (1, %s, %s) ON CONFLICT DO NOTHING",
+                    (LOCK_INSTANCE_NAME, now)
+                )
+                if cur.rowcount > 0:
+                    conn.commit()
+                    return True
 
-            cur.execute(
-                "UPDATE bot_lock SET instance_name = %s, last_heartbeat = %s "
-                "WHERE id = 1 AND (instance_name = %s OR last_heartbeat < %s)",
-                (LOCK_INSTANCE_NAME, now, LOCK_INSTANCE_NAME, stale_before)
-            )
-            conn.commit()
-            return cur.rowcount > 0
+                cur.execute(
+                    "UPDATE bot_lock SET instance_name = %s, last_heartbeat = %s "
+                    "WHERE id = 1 AND (instance_name = %s OR last_heartbeat < %s)",
+                    (LOCK_INSTANCE_NAME, now, LOCK_INSTANCE_NAME, stale_before)
+                )
+                conn.commit()
+                return cur.rowcount > 0
+    except Exception as e:
+        logger.warning(f"PG unreachable in sync_acquire_lock: {e}")
+        return True  # Assume we have the lock — safer than crashing the process
 
 
 def sync_release_lock():
@@ -354,14 +358,17 @@ def sync_release_lock():
     if not dsn:
         return
 
-    with psycopg.connect(dsn) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE bot_lock SET last_heartbeat = %s "
-                "WHERE id = 1 AND instance_name = %s",
-                (datetime.datetime.utcnow() - timedelta(seconds=3600), LOCK_INSTANCE_NAME)
-            )
-        conn.commit()
+    try:
+        with psycopg.connect(dsn, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE bot_lock SET last_heartbeat = %s "
+                    "WHERE id = 1 AND instance_name = %s",
+                    (datetime.datetime.utcnow() - timedelta(seconds=3600), LOCK_INSTANCE_NAME)
+                )
+            conn.commit()
+    except Exception:
+        pass  # Best-effort — lock will become stale naturally
 
 
 # ─── Draft → Production sync ──────────────────────────────────────────
