@@ -324,6 +324,19 @@ def main():
         logger.error("❌ BOT_TOKEN is missing!")
         sys.exit(1)
 
+    # ── Prevent Windows sleep while bot is running ──
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ES_CONTINUOUS = 0x80000000
+            ES_SYSTEM_REQUIRED = 0x00000001
+            ctypes.windll.kernel32.SetThreadExecutionState(
+                ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+            )
+            logger.info("Windows sleep prevention activated")
+        except Exception as e:
+            logger.warning(f"Failed to set sleep prevention: {e}")
+
     # Ensure the bot_lock table exists (for sync lock ops)
     sync_ensure_lock_table()
 
@@ -361,6 +374,15 @@ def main():
 
         logger.info("Bot stopped normally. Exiting.")
         break
+
+    # ── Restore Windows sleep after bot exits ──
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ES_CONTINUOUS = 0x80000000
+            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
